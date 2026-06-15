@@ -1,0 +1,74 @@
+name: Test Release (TestPyPI)
+
+# Manually-triggered dry-run that uploads the current main to TestPyPI.
+# Use this once before cutting a real v*.*.* tag, to verify the whole
+# release pipeline (build → twine check → upload → install) works.
+#
+# After a successful run, install from TestPyPI with:
+#   pip install -i https://test.pypi.org/simple/ \
+#               --extra-index-url https://pypi.org/simple/ \
+#               superbryn-pipecat-observer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: "Suffix appended to base version (e.g. dev1, rc1). Required so TestPyPI never sees a clashing version."
+        required: true
+        default: "dev1"
+
+jobs:
+  publish-testpypi:
+    name: Build and publish to TestPyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/superbryn-pipecat-observer
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Append suffix to package version
+        env:
+          SUFFIX: ${{ github.event.inputs.version_suffix }}
+        run: |
+          python - <<'PY'
+          import os, re, pathlib
+          suffix = os.environ["SUFFIX"]
+          path = pathlib.Path("pyproject.toml")
+          text = path.read_text()
+          # match `version = "X.Y.Z"` in the [project] table
+          new = re.sub(
+              r'(version\s*=\s*")([0-9]+\.[0-9]+\.[0-9]+)(")',
+              lambda m: f'{m.group(1)}{m.group(2)}.{suffix}{m.group(3)}',
+              text,
+              count=1,
+          )
+          assert new != text, "pyproject.toml version not modified"
+          path.write_text(new)
+          print(new[: new.find('\n', new.find('version')) + 1])
+          PY
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Check artifacts
+        run: twine check dist/*
+
+      - name: Publish to TestPyPI (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
