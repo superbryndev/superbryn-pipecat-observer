@@ -159,9 +159,9 @@ VERSION_ID=v1.2.0
 
 ### Usage Metrics (`MetricsFrame`)
 Captured automatically when `enable_usage_metrics=True`:
-- **LLM:** input tokens, output tokens, model, provider
-- **TTS:** character count, model, provider, voice ID
-- **STT:** model, provider, audio duration
+- **LLM:** input tokens, output tokens, model, provider (from `LLMUsageMetricsData`)
+- **TTS:** character count, model, provider, voice ID (from `TTSUsageMetricsData`)
+- **STT:** model, provider (audio duration is reserved for future use — Pipecat does not currently emit an STT usage metric)
 
 ### Latency Metrics
 - Per-turn response delay (user stop → bot speak start)
@@ -205,7 +205,7 @@ Captured automatically when `enable_usage_metrics=True`:
           "text": "Hello, how are you?",
           "start_time_ms": 5000,
           "end_time_ms": 5000,
-          "confidence": 0.98
+          "confidence": null
         },
         {
           "speaker": "agent",
@@ -233,7 +233,7 @@ Captured automatically when `enable_usage_metrics=True`:
     "usage": {
       "llm_input_tokens": 1250,
       "llm_output_tokens": 850,
-      "stt_duration_seconds": 45.2,
+      "stt_duration_seconds": 0.0,
       "tts_characters": 1200
     },
     "latency": {
@@ -243,6 +243,12 @@ Captured automatically when `enable_usage_metrics=True`:
   }
 }
 ```
+
+#### Field availability notes
+
+- **`transcript.turns[].confidence`** — present in the schema for forward compatibility, but Pipecat's stable `TranscriptionFrame` (as of 1.3.0) does not carry a confidence score, so this field is `null` in practice today.
+- **`usage.stt_duration_seconds`** — placeholder; Pipecat 1.3.0 does not emit an STT usage metric (no `STTUsageMetricsData` exists upstream), so this field is always `0.0`. It will start populating automatically once Pipecat ships STT usage metrics.
+- **`recording_url`, `from_number`, `to_number`, `transport`** — only set if you pass them into `SuperbrynObserver(...)`. Otherwise `null`.
 
 ## 🛠️ Advanced Usage
 
