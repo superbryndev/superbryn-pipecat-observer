@@ -116,8 +116,6 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
 | Variable | Required | Description | Default |
 |----------|----------|-------------|---------|
 | `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication | - |
-| `SUPERBRYN_WEBHOOK_URL` | ⚪ Optional | Override the ingest URL (staging, on-prem, local dev) | `https://api.superbryn.com/webhooks/obs/pipecat` |
-| `WEBHOOK_URL` | ⚪ Optional | Alias for `SUPERBRYN_WEBHOOK_URL` | - |
 | `AGENT_ID` | ⚪ Optional | Unique agent identifier stamped on every call | `"pipecat-agent"` |
 | `VERSION_ID` | ⚪ Optional | Agent version identifier | `"v1"` |
 
@@ -256,15 +254,6 @@ Pass the API key directly instead of using the environment variable:
 SuperbrynObserver(
     agent_name="support-bot",
     api_key="sb_live_...",
-)
-```
-
-### Custom Webhook URL (Staging / On-Prem)
-
-```python
-SuperbrynObserver(
-    agent_name="support-bot",
-    webhook_url="https://staging.example.com/webhooks/obs/pipecat",
 )
 ```
 
