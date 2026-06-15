@@ -2,7 +2,7 @@
 
 Drop-in [Pipecat](https://github.com/pipecat-ai/pipecat) observer that automatically reports call transcripts, metrics, and usage to [SuperBryn](https://superbryn.com) at the end of each session.
 
-Same model as `livekit-evals` — set an env var, add one observer to your pipeline, done.
+Set an env var, add one observer to your pipeline, done.
 
 ## Install
 
