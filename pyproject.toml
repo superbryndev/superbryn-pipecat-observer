@@ -48,3 +48,22 @@ Issues = "https://github.com/superbryndev/superbryn-pipecat-observer/issues"
 where = ["."]
 include = ["superbryn_pipecat_observer*"]
 exclude = ["tests*", "examples*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "B008",   # default arg call — common pattern in observer constructors
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_import.py" = ["F401", "F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"

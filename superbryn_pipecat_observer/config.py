@@ -11,9 +11,7 @@ both integrations see a single consistent set of variables.
 
 import os
 
-_DEFAULT_WEBHOOK_URL = (
-    "https://riaahcilmtirmkoulgjy.supabase.co/functions/v1/webhooks-pipecat"
-)
+_DEFAULT_WEBHOOK_URL = "https://api.superbryn.com/webhooks/obs/pipecat"
 
 WEBHOOK_CONFIG = {
     "url": os.getenv("SUPERBRYN_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or _DEFAULT_WEBHOOK_URL,

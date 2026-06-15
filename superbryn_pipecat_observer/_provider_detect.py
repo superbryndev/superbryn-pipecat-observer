@@ -6,10 +6,8 @@ normalized call payload (lets the SuperBryn analytics roll up
 "OpenAI calls across all sources" consistently).
 """
 
-from typing import Optional
 
-
-def detect_provider_from_model(model_name: Optional[str]) -> str:
+def detect_provider_from_model(model_name: str | None) -> str:
     """Best-effort provider tag from a model / voice / module string."""
     if not model_name:
         return "unknown"
@@ -73,7 +71,7 @@ def detect_provider_from_model(model_name: Optional[str]) -> str:
     return "unknown"
 
 
-def detect_provider_from_module(module_path: Optional[str]) -> str:
+def detect_provider_from_module(module_path: str | None) -> str:
     """
     Extract provider name from a Pipecat service's __module__.
 

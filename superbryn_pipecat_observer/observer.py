@@ -23,10 +23,10 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
-from .config import WEBHOOK_CONFIG, AGENT_CONFIG
 from ._provider_detect import detect_provider_from_model
+from .config import AGENT_CONFIG, WEBHOOK_CONFIG
 
 try:
     from pipecat.observers.base_observer import BaseObserver, FramePushed
@@ -61,15 +61,15 @@ class SuperbrynObserver(BaseObserver):
     def __init__(
         self,
         *,
-        agent_name: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        api_key: Optional[str] = None,
-        webhook_url: Optional[str] = None,
-        transport: Optional[str] = None,
-        from_number: Optional[str] = None,
-        to_number: Optional[str] = None,
-        recording_url: Optional[str] = None,
-        extra_metadata: Optional[dict[str, Any]] = None,
+        agent_name: str | None = None,
+        agent_id: str | None = None,
+        api_key: str | None = None,
+        webhook_url: str | None = None,
+        transport: str | None = None,
+        from_number: str | None = None,
+        to_number: str | None = None,
+        recording_url: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.agent_id = agent_id or AGENT_CONFIG["id"]
@@ -83,12 +83,12 @@ class SuperbrynObserver(BaseObserver):
         self.extra_metadata = extra_metadata or {}
 
         self.session_id = str(uuid.uuid4())
-        self.started_at: Optional[datetime] = None
-        self.ended_at: Optional[datetime] = None
-        self._call_start_ms: Optional[int] = None
+        self.started_at: datetime | None = None
+        self.ended_at: datetime | None = None
+        self._call_start_ms: int | None = None
 
         self.transcript_turns: list[dict[str, Any]] = []
-        self._last_user_end_ms: Optional[int] = None
+        self._last_user_end_ms: int | None = None
 
         self.usage = {
             "llm_provider": None,
@@ -104,22 +104,18 @@ class SuperbrynObserver(BaseObserver):
             "tts_characters": 0,
         }
         self.latencies_ms: list[float] = []
-        self.call_end_reason: Optional[str] = None
+        self.call_end_reason: str | None = None
         self._sent = False
 
         if not self.api_key:
-            logger.warning(
-                "SUPERBRYN_API_KEY not configured — SuperbrynObserver will no-op."
-            )
+            logger.warning("SUPERBRYN_API_KEY not configured — SuperbrynObserver will no-op.")
 
     # ── Pipeline lifecycle ────────────────────────────────────────────────
 
     async def on_pipeline_started(self) -> None:
         self.started_at = datetime.now(timezone.utc)
         self._call_start_ms = int(self.started_at.timestamp() * 1000)
-        logger.info(
-            "SUPERBRYN_PIPECAT_CALL_STARTED: session_id=%s", self.session_id
-        )
+        logger.info("SUPERBRYN_PIPECAT_CALL_STARTED: session_id=%s", self.session_id)
 
     async def on_pipeline_finished(self) -> None:
         if self._sent:
@@ -130,7 +126,7 @@ class SuperbrynObserver(BaseObserver):
 
     # ── Frame observation ────────────────────────────────────────────────
 
-    async def on_push_frame(self, data: "FramePushed") -> None:  # type: ignore[override]
+    async def on_push_frame(self, data: FramePushed) -> None:  # type: ignore[override]
         """
         Inspect frames as they flow between processors.
 
@@ -169,9 +165,7 @@ class SuperbrynObserver(BaseObserver):
     # ── Capture helpers ──────────────────────────────────────────────────
 
     def _now_ms(self) -> int:
-        return int(datetime.now(timezone.utc).timestamp() * 1000) - (
-            self._call_start_ms or 0
-        )
+        return int(datetime.now(timezone.utc).timestamp() * 1000) - (self._call_start_ms or 0)
 
     def _capture_user_turn(self, frame: Any) -> None:
         text = (getattr(frame, "text", "") or "").strip()
@@ -207,20 +201,14 @@ class SuperbrynObserver(BaseObserver):
                 "start_time_ms": now_ms,
                 "end_time_ms": now_ms,
                 "latency_ms": (
-                    now_ms - self._last_user_end_ms
-                    if self._last_user_end_ms is not None
-                    else None
+                    now_ms - self._last_user_end_ms if self._last_user_end_ms is not None else None
                 ),
             }
         )
 
     def _mark_bot_response_start(self) -> None:
         now_ms = self._now_ms()
-        latency = (
-            now_ms - self._last_user_end_ms
-            if self._last_user_end_ms is not None
-            else None
-        )
+        latency = now_ms - self._last_user_end_ms if self._last_user_end_ms is not None else None
         if latency is not None and latency >= 0:
             self.latencies_ms.append(float(latency))
         # Open a placeholder bot turn — text gets filled by TextFrame.
@@ -248,9 +236,7 @@ class SuperbrynObserver(BaseObserver):
             if cls_name == "LLMUsageMetricsData":
                 tok = getattr(rec, "value", None)
                 if tok is not None:
-                    self.usage["llm_input_tokens"] += int(
-                        getattr(tok, "prompt_tokens", 0) or 0
-                    )
+                    self.usage["llm_input_tokens"] += int(getattr(tok, "prompt_tokens", 0) or 0)
                     self.usage["llm_output_tokens"] += int(
                         getattr(tok, "completion_tokens", 0) or 0
                     )
@@ -312,11 +298,7 @@ class SuperbrynObserver(BaseObserver):
         if self.started_at and self.ended_at:
             duration_seconds = (self.ended_at - self.started_at).total_seconds()
 
-        avg_latency = (
-            sum(self.latencies_ms) / len(self.latencies_ms)
-            if self.latencies_ms
-            else None
-        )
+        avg_latency = sum(self.latencies_ms) / len(self.latencies_ms) if self.latencies_ms else None
         p95_latency = None
         if self.latencies_ms:
             sorted_lat = sorted(self.latencies_ms)
@@ -369,9 +351,7 @@ class SuperbrynObserver(BaseObserver):
 
     async def _send_webhook(self) -> None:
         if not self.api_key:
-            logger.info(
-                "SUPERBRYN_PIPECAT_SKIPPED: no API key configured"
-            )
+            logger.info("SUPERBRYN_PIPECAT_SKIPPED: no API key configured")
             return
         if not self.webhook_url:
             logger.warning("SUPERBRYN_PIPECAT_NO_URL: webhook URL not configured")
@@ -412,9 +392,7 @@ class SuperbrynObserver(BaseObserver):
                             resp.status,
                         )
                     else:
-                        logger.error(
-                            "SUPERBRYN_PIPECAT_HTTP_%d: %s", resp.status, body[:200]
-                        )
+                        logger.error("SUPERBRYN_PIPECAT_HTTP_%d: %s", resp.status, body[:200])
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.error("SUPERBRYN_PIPECAT_ERROR: %s", exc, exc_info=True)
 
@@ -426,6 +404,4 @@ class SuperbrynObserver(BaseObserver):
         only if it appears between LLM-response-start and the next user
         transcription — i.e. there's an open bot turn waiting for text.
         """
-        return any(
-            t["speaker"] == "agent" and not t["text"] for t in self.transcript_turns
-        )
+        return any(t["speaker"] == "agent" and not t["text"] for t in self.transcript_turns)
