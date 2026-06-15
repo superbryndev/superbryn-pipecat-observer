@@ -13,10 +13,10 @@ import os
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
 
 from superbryn_pipecat_observer import SuperbrynObserver
