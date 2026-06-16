@@ -5,9 +5,11 @@ Pipecat itself has no unified recording API — each transport records audio
 differently or not at all. This subpackage isolates that per-transport logic
 so the observer stays transport-agnostic.
 
-Supported transports today:
+Supported transports today (native recording auto-fetch):
   - `DailyTransport`                       — Daily Cloud recording
   - `FastAPIWebsocketTransport` + Twilio   — Twilio REST recordings
+  - `FastAPIWebsocketTransport` + Plivo    — Plivo REST recordings
+  - `FastAPIWebsocketTransport` + Vobiz    — Vobiz REST recordings
 
 Not supported (no transport-side recording mechanism):
   - `WebsocketServerTransport` — generic WS server
@@ -37,16 +39,29 @@ from typing import Any
 
 from .base import RecordingAdapter
 from .daily import DailyRecordingAdapter
+from .plivo import PlivoRecordingAdapter
 from .twilio import TwilioRecordingAdapter
+from .vobiz import VobizRecordingAdapter
 
 logger = logging.getLogger("superbryn_pipecat_observer.transports")
 
 __all__ = [
     "RecordingAdapter",
     "DailyRecordingAdapter",
+    "PlivoRecordingAdapter",
     "TwilioRecordingAdapter",
+    "VobizRecordingAdapter",
     "get_recording_adapter",
 ]
+
+# Carriers that ride on top of `FastAPIWebsocketTransport` are distinguished
+# only by which serializer is attached. We probe the transport's class /
+# module first, then the serializer's class / module. First match wins.
+_CARRIER_SIGNATURES: tuple[tuple[str, type[RecordingAdapter]], ...] = (
+    ("twilio", TwilioRecordingAdapter),
+    ("plivo", PlivoRecordingAdapter),
+    ("vobiz", VobizRecordingAdapter),
+)
 
 
 def get_recording_adapter(transport: Any) -> RecordingAdapter | None:
@@ -64,22 +79,26 @@ def get_recording_adapter(transport: Any) -> RecordingAdapter | None:
     module = (type(transport).__module__ or "").lower()
 
     try:
-        # Daily: `DailyTransport` from `pipecat.transports.services.daily`
+        # Daily owns its own transport class — direct match.
         if cls_name == "DailyTransport" or "daily" in module:
             return DailyRecordingAdapter(transport)
 
-        # Twilio rides on top of FastAPIWebsocketTransport with a Twilio
-        # serializer. We detect by sniffing for `twilio` anywhere in the
-        # transport's class name, module, or attached serializer module.
-        if "twilio" in module or "twilio" in cls_name.lower():
-            return TwilioRecordingAdapter(transport)
+        # Carriers (Twilio / Plivo / Vobiz) all ride on
+        # FastAPIWebsocketTransport and are distinguished by the serializer.
+        # Probe transport identifiers first, then the attached serializer.
+        for tag, AdapterCls in _CARRIER_SIGNATURES:
+            if tag in module or tag in cls_name.lower():
+                return AdapterCls(transport)
+
         serializer = getattr(transport, "_serializer", None) or getattr(
             transport, "serializer", None
         )
         if serializer is not None:
             ser_module = (type(serializer).__module__ or "").lower()
-            if "twilio" in ser_module or "twilio" in type(serializer).__name__.lower():
-                return TwilioRecordingAdapter(transport)
+            ser_cls = type(serializer).__name__.lower()
+            for tag, AdapterCls in _CARRIER_SIGNATURES:
+                if tag in ser_module or tag in ser_cls:
+                    return AdapterCls(transport)
 
     except Exception as exc:  # noqa: BLE001 — detection must never raise
         logger.debug("transport adapter detection failed: %s", exc)

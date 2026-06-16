@@ -58,10 +58,12 @@ def test_observer_no_api_key_is_noop() -> None:
 
 
 def test_transport_adapter_detection() -> None:
-    """Class-name-based detection picks the right adapter per transport."""
+    """Class-name + serializer-module detection picks the right adapter per transport."""
     from superbryn_pipecat_observer.transports import (
         DailyRecordingAdapter,
+        PlivoRecordingAdapter,
         TwilioRecordingAdapter,
+        VobizRecordingAdapter,
         get_recording_adapter,
     )
 
@@ -71,9 +73,18 @@ def test_transport_adapter_detection() -> None:
     class _TwilioFrameSerializer:
         __module__ = "pipecat.serializers.twilio"
 
-    class FastAPIWebsocketTransport:
-        def __init__(self) -> None:
-            self._serializer = _TwilioFrameSerializer()
+    class _PlivoFrameSerializer:
+        __module__ = "pipecat.serializers.plivo"
+
+    class _VobizFrameSerializer:
+        __module__ = "pipecat.serializers.vobiz"
+
+    def _ws_transport_with(serializer_cls):  # noqa: ANN001
+        class FastAPIWebsocketTransport:
+            def __init__(self) -> None:
+                self._serializer = serializer_cls()
+
+        return FastAPIWebsocketTransport()
 
     class RawWebRTCTransport:
         pass
@@ -85,14 +96,52 @@ def test_transport_adapter_detection() -> None:
         pass
 
     assert isinstance(get_recording_adapter(DailyTransport()), DailyRecordingAdapter)
-    assert isinstance(get_recording_adapter(FastAPIWebsocketTransport()), TwilioRecordingAdapter)
+    assert isinstance(
+        get_recording_adapter(_ws_transport_with(_TwilioFrameSerializer)),
+        TwilioRecordingAdapter,
+    )
+    assert isinstance(
+        get_recording_adapter(_ws_transport_with(_PlivoFrameSerializer)),
+        PlivoRecordingAdapter,
+    )
+    assert isinstance(
+        get_recording_adapter(_ws_transport_with(_VobizFrameSerializer)),
+        VobizRecordingAdapter,
+    )
     # Transports with no recording API → no adapter (caller passes recording_url manually).
     assert get_recording_adapter(RawWebRTCTransport()) is None
     assert get_recording_adapter(SmallWebRTCTransport()) is None
     assert get_recording_adapter(WebsocketServerTransport()) is None
     # Legacy string label must not produce an adapter.
     assert get_recording_adapter("daily") is None
+    assert get_recording_adapter("plivo") is None
+    assert get_recording_adapter("vobiz") is None
     assert get_recording_adapter(None) is None
+
+
+def test_plivo_and_vobiz_adapters_warn_when_env_missing() -> None:
+    """Adapters must not crash when their env credentials are absent."""
+    import os as _os
+
+    from superbryn_pipecat_observer.transports import (
+        PlivoRecordingAdapter,
+        VobizRecordingAdapter,
+    )
+
+    for var in (
+        "PLIVO_AUTH_ID",
+        "PLIVO_AUTH_TOKEN",
+        "PLIVO_CALL_UUID",
+        "VOBIZ_AUTH_ID",
+        "VOBIZ_AUTH_TOKEN",
+        "VOBIZ_CALL_UUID",
+    ):
+        _os.environ.pop(var, None)
+
+    # Just instantiating must not raise; observer fail-open behaviour is
+    # exercised in `test_lifecycle_fail_open_on_adapter_error`.
+    PlivoRecordingAdapter(transport=object())
+    VobizRecordingAdapter(transport=object())
 
 
 def test_observer_accepts_transport_object() -> None:
@@ -190,4 +239,5 @@ if __name__ == "__main__":
     test_lifecycle_fail_open_on_adapter_error()
     test_no_recording_module_exposed()
     test_observer_rejects_record_audio_kwarg()
+    test_plivo_and_vobiz_adapters_warn_when_env_missing()
     print("All smoke tests passed.")
