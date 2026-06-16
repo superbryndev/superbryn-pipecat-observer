@@ -185,6 +185,32 @@ class SuperbrynObserver(BaseObserver):
         """
         await self._finalize_session()
 
+    def attach_to_task(self, task: Any) -> None:
+        """Register the observer's finalize hook on a Pipecat 1.3+ ``PipelineTask``.
+
+        Pipecat 1.3 fires ``on_pipeline_finished`` only as a task-level event
+        handler — observers no longer receive it. The ``on_push_frame``
+        terminal-frame fallback can race with ``task.cancel()`` teardown,
+        so the recording fetch + webhook never run on a forced disconnect.
+
+        Call this once after constructing the ``PipelineTask`` to guarantee
+        the finalize step runs and is awaited by Pipecat's cleanup::
+
+            observer = SuperbrynObserver(...)
+            task = PipelineTask(pipeline, observers=[observer], ...)
+            observer.attach_to_task(task)
+
+        Safe to call on older Pipecat versions — the registration silently
+        no-ops if the task doesn't expose ``event_handler``.
+        """
+        register = getattr(task, "event_handler", None)
+        if register is None:
+            return
+
+        @register("on_pipeline_finished")  # type: ignore[misc]
+        async def _on_finished(_task: Any) -> None:  # noqa: ANN401
+            await self._finalize_session()
+
     async def _finalize_session(self) -> None:
         """Build the call payload and ship it to SuperBryn.
 

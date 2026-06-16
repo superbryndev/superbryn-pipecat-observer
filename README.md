@@ -4,19 +4,20 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Track and evaluate your [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI agents with just 2 lines of code.**
+**Track and evaluate your [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI agents with just 3 lines of code.**
 
 Automatically capture transcripts, usage metrics, latency data, and session analytics from your Pipecat pipelines. Perfect for monitoring, debugging, and optimizing your voice AI applications.
 
 ## ✨ Features
 
-- 🎯 **2-Line Integration** - Add to any Pipecat agent in seconds
+- 🎯 **3-Line Integration** - Add to any Pipecat agent in seconds (observer + `observers=[...]` + `attach_to_task`)
 - 📝 **Precise Transcripts** - Speaker turns with timestamps from `TranscriptionFrame` and `TextFrame` events
 - 📊 **Usage Metrics** - Track LLM tokens, TTS character counts, STT duration
 - ⚡ **Latency Tracking** - Response time between user speech end and bot response start (avg + p95)
 - 🔍 **Auto-Detection** - Automatically extracts models, providers, and voice IDs from your services
 - 📞 **Telephony Ready** - Pass `from_number` / `to_number` / `transport` for SIP / Daily / Twilio / WebRTC calls
-- 🎥 **Auto-Recording (Daily / Twilio)** - Pass the transport object and the observer pulls the recording URL from the transport's own API. See [Automatic Recording](#automatic-recording-daily--twilio)
+- 🎥 **Auto-Recording (Daily / Twilio / Plivo / Vobiz)** - Pass the transport object and the observer pulls the recording URL from the transport's own API. See [Automatic Recording](#automatic-recording-daily--twilio--plivo--vobiz)
+- 🪝 **Reliable Finalize on Pipecat 1.3+** - `observer.attach_to_task(task)` registers the finalize step as a task-level `on_pipeline_finished` handler so the webhook ships even on forced `task.cancel()` / client-disconnect teardown
 - 🛡️ **Fail-Open** - Never crashes your pipeline if telemetry delivery fails
 - 🔐 **Secure** - API key authentication with HTTPS webhook delivery
 - 🔄 **Frame-Version Tolerant** - Detects frames by class name so a Pipecat upgrade won't hard-break the observer
@@ -39,7 +40,15 @@ pip install superbryn-pipecat-observer
 
 ### Integration
 
-Add the observer to your `PipelineTask`. Pick the path that matches your transport — the observer auto-fetches the recording URL for Daily and Twilio, otherwise you pass it through.
+Add the observer to your `PipelineTask` and call `attach_to_task(task)` so the finalize step runs on shutdown. Pick the path that matches your transport — the observer auto-fetches the recording URL for Daily, Twilio, Plivo, and Vobiz; for everything else you pass it through.
+
+> 🪝 **About `attach_to_task(task)`** — Pipecat 1.3 removed the
+> `on_pipeline_finished` lifecycle hook from `BaseObserver` and only
+> fires it as a task-level event. Without `attach_to_task(task)` the
+> finalize step relies on a `CancelFrame`/`EndFrame` fallback that races
+> with `task.cancel()` teardown, so the webhook (and any recording fetch)
+> may not run on a client-disconnect. Calling `attach_to_task(task)` is
+> safe on every Pipecat version — it silently no-ops on older releases.
 
 **Option A — Daily / Twilio / Plivo / Vobiz (auto-fetch recording URL):**
 
@@ -47,18 +56,19 @@ Add the observer to your `PipelineTask`. Pick the path that matches your transpo
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from superbryn_pipecat_observer import SuperbrynObserver
 
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=daily_transport,                       # or twilio / plivo / vobiz transport
+)
+
 task = PipelineTask(
     pipeline,
-    observers=[
-        SuperbrynObserver(
-            agent_name="support-bot",
-            transport=daily_transport,                   # or twilio / plivo / vobiz transport
-        ),
-    ],
+    observers=[observer],
     params=PipelineParams(
-        enable_usage_metrics=True,                       # required for token / TTS char counts
+        enable_usage_metrics=True,                   # required for token / TTS char counts
     ),
 )
+observer.attach_to_task(task)                        # ship the webhook on shutdown
 ```
 
 Set the credential pair for whichever transport you use:
@@ -78,19 +88,20 @@ SuperBryn does not record audio itself. Record on your side and pass the URL thr
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from superbryn_pipecat_observer import SuperbrynObserver
 
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport="plivo",                                   # string label
+    recording_url="https://your-bucket/recordings/abc.mp3",
+)
+
 task = PipelineTask(
     pipeline,
-    observers=[
-        SuperbrynObserver(
-            agent_name="support-bot",
-            transport="plivo",                           # string label
-            recording_url="https://your-bucket/recordings/abc.mp3",
-        ),
-    ],
+    observers=[observer],
     params=PipelineParams(
         enable_usage_metrics=True,                       # required for token / TTS char counts
     ),
 )
+observer.attach_to_task(task)
 ```
 
 **Option C — Multiple carriers, same agent (e.g. Twilio for global + Plivo / Vobiz for India):**
@@ -132,6 +143,17 @@ async def plivo_handler(ws):
     transport = FastAPIWebsocketTransport(ws, params=...)
     observer = build_observer("plivo", transport, call_id=ws.query_params["CallUUID"])
     await run_call(transport, observer)
+
+
+# Inside run_call(...), build the PipelineTask and wire the observer:
+async def run_call(transport, observer):
+    task = PipelineTask(
+        pipeline,
+        observers=[observer],
+        params=PipelineParams(enable_usage_metrics=True),
+    )
+    observer.attach_to_task(task)
+    await PipelineRunner().run(task)
 ```
 
 Tag each call with `extra_metadata={"carrier": "..."}` so you can slice the dashboard by carrier / region without splitting the agent.
@@ -177,18 +199,19 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
     ])
 
     # Drop in the observer — that's the whole integration
+    observer = SuperbrynObserver(
+        agent_name="support-bot",
+        transport="websocket",
+    )
+
     task = PipelineTask(
         pipeline,
-        observers=[
-            SuperbrynObserver(
-                agent_name="support-bot",
-                transport="websocket",
-            ),
-        ],
+        observers=[observer],
         params=PipelineParams(
             enable_usage_metrics=True,
         ),
     )
+    observer.attach_to_task(task)   # finalize on Pipecat 1.3+ teardown
 
     await PipelineRunner().run(task)
 ```
@@ -275,14 +298,15 @@ Captured automatically when `enable_usage_metrics=True`:
 1. **Pipeline Observation** - Registered via `PipelineTask(observers=[...])` — runs **alongside** your pipeline, not inside it
 2. **Frame Inspection** - `on_push_frame` watches every frame flowing between processors and aggregates by class name (so a Pipecat upgrade doesn't break it)
 3. **Auto-Detection** - Inspects the module path of each service (`*.stt.*`, `*.llm.*`, `*.tts.*`) to tag providers automatically
-4. **Webhook Delivery** - When `on_pipeline_finished` fires, builds a normalized call payload and POSTs it to SuperBryn
+4. **Finalize Hook** - `observer.attach_to_task(task)` registers the finalize step as a task-level `on_pipeline_finished` handler (Pipecat 1.3+). Pipecat awaits this handler during cleanup, so the recording fetch and webhook complete even on forced `task.cancel()` / client-disconnect shutdowns. As a fallback, terminal frames (`CancelFrame` / `EndFrame` / `StopFrame`) seen on `on_push_frame` also trigger finalize — `_finalize_session()` is idempotent so the webhook is sent at most once.
+5. **Webhook Delivery** - The finalize step builds a normalized call payload and POSTs it to SuperBryn over HTTPS with `X-API-Key` auth
 
 ### Webhook Payload Format
 
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.2.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.3.4",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -322,7 +346,7 @@ Captured automatically when `enable_usage_metrics=True`:
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.2.0"
+      "pipeline_version": "@superbryn/pipecat-observer@0.3.4"
     },
     "usage": {
       "llm_input_tokens": 1250,
@@ -396,10 +420,13 @@ These show up on the call record so you can filter / segment by direction, area 
 > top of LiveKit Agents — it integrates more deeply and produces stereo
 > recordings out of the box.
 
-### Automatic Recording (Daily / Twilio)
+### Automatic Recording (Daily / Twilio / Plivo / Vobiz)
 
-For Daily and Twilio, pass the **transport object itself** (instead of a string
-label) and the observer wires up recording for you — no manual URL plumbing:
+For Daily, Twilio, Plivo, and Vobiz, pass the **transport object itself**
+(instead of a string label) and the observer wires up recording for you —
+no manual URL plumbing, no `extra_metadata` boilerplate. The observer reads
+the call identifier directly off the transport's serializer at finalize
+time and fetches the recording URL from the transport's own REST API:
 
 ```python
 observer = SuperbrynObserver(
@@ -434,6 +461,7 @@ export DAILY_API_KEY=...        # same key you use to create Daily rooms
 **3. Wire the observer:**
 
 ```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.transports.services.daily import DailyTransport
 from superbryn_pipecat_observer import SuperbrynObserver
 
@@ -443,6 +471,9 @@ observer = SuperbrynObserver(
     agent_name="support-bot",
     transport=daily_transport,   # auto-records to Daily cloud + fetches URL
 )
+
+task = PipelineTask(pipeline, observers=[observer], params=PipelineParams(enable_usage_metrics=True))
+observer.attach_to_task(task)
 ```
 
 > Daily finalizes recordings asynchronously. If the access link isn't ready
@@ -483,6 +514,7 @@ client.calls.create(
 **4. Wire the observer:**
 
 ```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
 from superbryn_pipecat_observer import SuperbrynObserver
 
@@ -492,6 +524,9 @@ observer = SuperbrynObserver(
     agent_name="support-bot",
     transport=twilio_transport,
 )
+
+task = PipelineTask(pipeline, observers=[observer], params=PipelineParams(enable_usage_metrics=True))
+observer.attach_to_task(task)
 ```
 
 **CallSid hint:** Pipecat's Twilio integration doesn't always expose `CallSid`
@@ -508,25 +543,117 @@ SuperbrynObserver(
 
 ---
 
-#### Other transports (Plivo / Telnyx / WebSocket / SmallWebRTC / video avatars / …)
+#### Plivo setup
 
-For everything that isn't Daily or Twilio, SuperBryn does not record audio.
-Your transport (or carrier) owns the audio data — you record it there and
-pass the URL through:
+**1. Install:**
+
+```bash
+pip install superbryn-pipecat-observer
+```
+
+**2. Set env vars:**
+
+```bash
+export SUPERBRYN_API_KEY=sb_live_...
+export PLIVO_AUTH_ID=...
+export PLIVO_AUTH_TOKEN=...
+```
+
+**3. Enable recording on the Plivo side** — set `record="true"` on the
+`<Stream>` element of your answer XML (or POST `/Call/{call_uuid}/Record/`
+after the call connects). Plivo records on their side; this SDK never
+touches the audio bytes.
+
+**4. Wire the observer:**
+
+```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
+from superbryn_pipecat_observer import SuperbrynObserver
+
+plivo_transport = FastAPIWebsocketTransport(...)   # with the Plivo serializer
+
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=plivo_transport,
+)
+
+task = PipelineTask(pipeline, observers=[observer], params=PipelineParams(enable_usage_metrics=True))
+observer.attach_to_task(task)
+```
+
+The adapter reads `CallUUID` off the Plivo serializer at finalize time and
+fetches the recording from `https://api.plivo.com/v1/Account/{sid}/Recording/`.
+If sniffing fails for any reason, override with `PLIVO_CALL_UUID` env var or
+`extra_metadata={"call_uuid": "..."}`.
+
+---
+
+#### Vobiz setup
+
+**1. Install:**
+
+```bash
+pip install superbryn-pipecat-observer
+```
+
+**2. Set env vars:**
+
+```bash
+export SUPERBRYN_API_KEY=sb_live_...
+export VOBIZ_AUTH_ID=...
+export VOBIZ_AUTH_TOKEN=...
+```
+
+**3. Enable recording on the Vobiz side** — set `record="true"` on the
+`<Stream>` element of your answer XML (or POST `/Call/{call_uuid}/Record/`).
+Vobiz records on their side; this SDK never touches the audio bytes.
+
+**4. Wire the observer:**
+
+```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
+from superbryn_pipecat_observer import SuperbrynObserver
+
+vobiz_transport = FastAPIWebsocketTransport(...)   # with the Vobiz serializer
+
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=vobiz_transport,
+)
+
+task = PipelineTask(pipeline, observers=[observer], params=PipelineParams(enable_usage_metrics=True))
+observer.attach_to_task(task)
+```
+
+The adapter reads the call UUID off the Vobiz serializer at finalize time
+and fetches the recording from
+`https://api.vobiz.ai/api/v1/Account/{id}/Recording/` using the
+`X-Auth-ID` / `X-Auth-Token` header pair. If sniffing fails, override with
+`VOBIZ_CALL_UUID` env var or `extra_metadata={"call_uuid": "..."}`.
+
+---
+
+#### Other transports (Telnyx / Exotel / WebSocket / SmallWebRTC / video avatars / …)
+
+For everything that isn't Daily / Twilio / Plivo / Vobiz, SuperBryn does not
+record audio. Your transport (or carrier) owns the audio data — you record
+it there and pass the URL through:
 
 ```python
 SuperbrynObserver(
     agent_name="support-bot",
-    transport="plivo",                                  # or "telnyx", "websocket", etc.
+    transport="telnyx",                                 # or "websocket", "exotel", etc.
     recording_url="https://your-bucket/recordings/abc.mp3",
 )
 ```
 
 Pick the option that fits your transport:
 
-- **Carrier-managed (Plivo / Telnyx / Exotel / Vonage)** — enable recording
-  on the carrier when you place the call, then fetch the URL from their REST
-  API after the call ends and pass it in via `recording_url=...`
+- **Carrier-managed (Telnyx / Exotel / Vonage)** — enable recording on the
+  carrier when you place the call, then fetch the URL from their REST API
+  after the call ends and pass it in via `recording_url=...`
 - **WebRTC / WebSocket / SmallWebRTC** — there is no recording API. If you
   need audio, capture it on your own side (e.g. browser `MediaRecorder` or
   server-side ffmpeg piping the WS payload to S3) and pass the URL through
@@ -608,6 +735,20 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 | `SUPERBRYN_PIPECAT_AUTH_FAILED (403)` | Expired / disabled key | Generate a new API key |
 | `SUPERBRYN_PIPECAT_MISSING_AIOHTTP` | `aiohttp` missing | `pip install aiohttp>=3.9.0` |
 
+### Webhook Not Sent on Client Disconnect (Pipecat 1.3+)
+
+If `SUPERBRYN_PIPECAT_CALL_STARTED` shows up at session start but no `SUPERBRYN_PIPECAT_SENDING` / `SUPERBRYN_PIPECAT_SENT` appears at session end (typically after a forced `task.cancel(...)` from your `on_client_disconnected` handler), you're missing the task-level finalize hook.
+
+Pipecat 1.3 removed the `on_pipeline_finished` lifecycle hook from `BaseObserver` and only fires it as a task-level event. Without registering it, the `CancelFrame` fallback races with pipeline teardown and the webhook never runs. Fix:
+
+```python
+observer = SuperbrynObserver(...)
+task = PipelineTask(pipeline, observers=[observer], params=PipelineParams(enable_usage_metrics=True))
+observer.attach_to_task(task)   # ← add this line
+```
+
+`attach_to_task(task)` is a no-op on older Pipecat releases, so it's safe to keep regardless of version.
+
 ### Missing Usage Metrics
 
 Pipecat only emits `MetricsFrame`s when usage metrics are enabled at the task level:
@@ -628,7 +769,7 @@ The observer auto-detects providers from the producing service's module path and
 
 **TTS:** ElevenLabs, Cartesia, PlayHT, Resemble AI, Murf, WellSaid Labs, Speechify, Sarvam, Azure, AWS Polly, Google Cloud
 
-**Transport label (stamped on the call):** auto-derived from the transport object class name; common values include `daily`, `twilio`, `websocket`, `smallwebrtc`, `plivo`, `telnyx`. Pass a string explicitly if you want a custom label.
+**Transport label (stamped on the call):** auto-derived from the transport object class name; common values include `daily`, `twilio`, `plivo`, `vobiz`, `websocket`, `smallwebrtc`, `telnyx`. Pass a string explicitly if you want a custom label.
 
 If your provider isn't detected, it will show as `"unknown"` but the call still tracks normally.
 
