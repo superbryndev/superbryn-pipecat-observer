@@ -16,7 +16,7 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 - ⚡ **Latency Tracking** - Response time between user speech end and bot response start (avg + p95)
 - 🔍 **Auto-Detection** - Automatically extracts models, providers, and voice IDs from your services
 - 📞 **Telephony Ready** - Pass `from_number` / `to_number` / `transport` for SIP / Daily / Twilio / WebRTC calls
-- 🎥 **Recording URLs** - Forward egress recording links if your transport produces them
+- 🎥 **Auto-Recording (Daily / Twilio)** - Pass the transport object and the observer pulls the recording URL from the transport's own API. See [Automatic Recording](#automatic-recording-daily--twilio)
 - 🛡️ **Fail-Open** - Never crashes your pipeline if telemetry delivery fails
 - 🔐 **Secure** - API key authentication with HTTPS webhook delivery
 - 🔄 **Frame-Version Tolerant** - Detects frames by class name so a Pipecat upgrade won't hard-break the observer
@@ -37,19 +37,50 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 pip install superbryn-pipecat-observer
 ```
 
-### Integration (2 Lines)
+### Integration
 
-Add these lines to your Pipecat agent:
+Add the observer to your `PipelineTask`. Pick the path that matches your transport — the observer auto-fetches the recording URL for Daily and Twilio, otherwise you pass it through.
+
+**Option A — Daily / Twilio (auto-fetch recording URL):**
 
 ```python
 from pipecat.pipeline.task import PipelineTask, PipelineParams
-from superbryn_pipecat_observer import SuperbrynObserver  # 1. Import
+from superbryn_pipecat_observer import SuperbrynObserver
 
 task = PipelineTask(
     pipeline,
     params=PipelineParams(
-        enable_usage_metrics=True,                                  # required for token / TTS char counts
-        observers=[SuperbrynObserver(agent_name="support-bot")],    # 2. Add observer
+        enable_usage_metrics=True,                       # required for token / TTS char counts
+        observers=[
+            SuperbrynObserver(
+                agent_name="support-bot",
+                transport=daily_transport,               # or twilio_transport
+            ),
+        ],
+    ),
+)
+# requires DAILY_API_KEY (Daily) or TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN (Twilio)
+```
+
+**Option B — Other transport (Plivo / Telnyx / WebSocket / SmallWebRTC / video avatars / …):**
+
+SuperBryn does not record audio itself. Record on your side and pass the URL through:
+
+```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+from superbryn_pipecat_observer import SuperbrynObserver
+
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        enable_usage_metrics=True,                       # required for token / TTS char counts
+        observers=[
+            SuperbrynObserver(
+                agent_name="support-bot",
+                transport="plivo",                       # string label
+                recording_url="https://your-bucket/recordings/abc.mp3",
+            ),
+        ],
     ),
 )
 ```
@@ -57,6 +88,8 @@ task = PipelineTask(
 **That's it!** 🎉 Every completed call shows up in your SuperBryn **Monitor → Calls** view within seconds of session end.
 
 > ⚠️ **Important:** `enable_usage_metrics=True` must be set on `PipelineParams` for LLM token counts and TTS character counts to be captured.
+>
+> Recording is best-effort. If the auto-fetch fails (missing env var, transport not finalized, network error) the call record still ships — just without `recording_url`.
 
 ## 📖 Full Example
 
@@ -118,6 +151,10 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
 | `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication | - |
 | `AGENT_ID` | ⚪ Optional | Unique agent identifier stamped on every call | `"pipecat-agent"` |
 | `VERSION_ID` | ⚪ Optional | Agent version identifier | `"v1"` |
+| `DAILY_API_KEY` | ⚪ Optional | Required only if you pass a `DailyTransport` and want auto-recording | - |
+| `TWILIO_ACCOUNT_SID` | ⚪ Optional | Required only for Twilio auto-recording | - |
+| `TWILIO_AUTH_TOKEN` | ⚪ Optional | Required only for Twilio auto-recording | - |
+| `TWILIO_CALL_SID` | ⚪ Optional | Override if Twilio CallSid auto-detection fails | - |
 
 ### Setting Environment Variables
 
@@ -188,7 +225,7 @@ Captured automatically when `enable_usage_metrics=True`:
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.1.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.2.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "session_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -228,7 +265,7 @@ Captured automatically when `enable_usage_metrics=True`:
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.1.0"
+      "pipeline_version": "@superbryn/pipecat-observer@0.2.0"
     },
     "usage": {
       "llm_input_tokens": 1250,
@@ -263,17 +300,193 @@ SuperbrynObserver(
 )
 ```
 
-### Telephony / Transport Metadata
+### Telephony Metadata
+
+Attach phone numbers (and optionally a recording URL fallback) to any call:
 
 ```python
 SuperbrynObserver(
     agent_name="support-bot",
-    transport="twilio",            # "daily" | "twilio" | "webrtc" | "websocket" | ...
+    transport=twilio_transport,        # see Integration above for the two transport paths
     from_number="+15551234567",
     to_number="+15557654321",
-    recording_url="https://...",   # if your transport produces one
 )
 ```
+
+These show up on the call record so you can filter / segment by direction, area code, or DID.
+
+### Pipecat Transports — Compatibility Matrix
+
+| Transport | Pipecat class | Typical use case | Recording option |
+|-----------|---------------|------------------|------------------|
+| **Daily** | `DailyTransport` | Voice/video calls via Daily Cloud (WebRTC) — most popular all-in-one | ✅ Native (Daily Cloud) |
+| **Twilio** | `FastAPIWebsocketTransport` + Twilio serializer | Phone calls via Twilio Media Streams — most common for telephony | ✅ Native (Twilio REST) |
+| **Plivo / Telnyx / Exotel / Vonage** | `FastAPIWebsocketTransport` + respective serializer | Other carrier telephony — same shape as Twilio | ⚠️ Manual (pass `recording_url=...` from carrier REST) |
+| **Generic WebSocket** | `WebsocketServerTransport` | Custom apps with their own WS clients (Unity, mobile, etc.) | ❌ No recording (transport has no recording API) |
+| **SmallWebRTC** | `SmallWebRTCTransport` | Direct browser↔agent WebRTC (OpenAI Realtime-style demos) | ❌ No recording (transport has no recording API) |
+| **Tavus / HeyGen / Simli** | Video-avatar transports | Talking-head video agents | ⚠️ Manual (pass `recording_url=...` from avatar service) |
+| **Local audio** | `LocalAudioTransport` | Dev/testing with mic & speakers | ❌ Not applicable |
+
+> **"Native"** = the observer calls the transport's own recording API (Daily
+> Cloud, Twilio REST) and stamps the URL it returns. SuperBryn does **not**
+> record audio itself — your transport owns the audio data; we only surface
+> the URL it produces.
+
+> 💡 **Using LiveKit?** Don't use Pipecat + LiveKit + this package. Use
+> [`livekit-evals`](https://github.com/superbryndev/livekit-evals) directly on
+> top of LiveKit Agents — it integrates more deeply and produces stereo
+> recordings out of the box.
+
+### Automatic Recording (Daily / Twilio)
+
+For Daily and Twilio, pass the **transport object itself** (instead of a string
+label) and the observer wires up recording for you — no manual URL plumbing:
+
+```python
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=daily_transport,   # ← live transport object, not a string
+)
+```
+
+The observer detects the transport type at runtime and dispatches to the
+matching adapter. Detection is by class name + module path, so a Pipecat
+upgrade doesn't break it.
+
+Pick your transport below for a copy-paste setup.
+
+---
+
+#### Daily setup
+
+**1. Install:**
+
+```bash
+pip install superbryn-pipecat-observer
+```
+
+**2. Set env vars:**
+
+```bash
+export SUPERBRYN_API_KEY=sb_live_...
+export DAILY_API_KEY=...        # same key you use to create Daily rooms
+```
+
+**3. Wire the observer:**
+
+```python
+from pipecat.transports.services.daily import DailyTransport
+from superbryn_pipecat_observer import SuperbrynObserver
+
+daily_transport = DailyTransport(...)
+
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=daily_transport,   # auto-records to Daily cloud + fetches URL
+)
+```
+
+> Daily finalizes recordings asynchronously. If the access link isn't ready
+> within ~6 seconds after the call ends, the observer ships the call without
+> a URL and logs the recording id so you can backfill later.
+
+---
+
+#### Twilio setup
+
+**1. Install:**
+
+```bash
+pip install superbryn-pipecat-observer
+```
+
+**2. Set env vars:**
+
+```bash
+export SUPERBRYN_API_KEY=sb_live_...
+export TWILIO_ACCOUNT_SID=AC...
+export TWILIO_AUTH_TOKEN=...
+```
+
+**3. Enable recording on the Twilio side** (this SDK does **not** start
+recording — Twilio doesn't expose a safe mid-call API for that):
+
+```python
+# When creating the call
+client.calls.create(
+    url="https://your.app/voice/twiml",
+    to="+15557654321",
+    from_="+15551234567",
+    record=True,                     # or "record-from-answer"
+)
+```
+
+**4. Wire the observer:**
+
+```python
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
+from superbryn_pipecat_observer import SuperbrynObserver
+
+twilio_transport = FastAPIWebsocketTransport(...)   # with the Twilio serializer
+
+observer = SuperbrynObserver(
+    agent_name="support-bot",
+    transport=twilio_transport,
+)
+```
+
+**CallSid hint:** Pipecat's Twilio integration doesn't always expose `CallSid`
+on a stable attribute. The adapter sniffs several common locations; if
+auto-detection fails, pass it explicitly:
+
+```python
+SuperbrynObserver(
+    agent_name="support-bot",
+    transport=twilio_transport,
+    extra_metadata={"call_sid": "CA..."},   # or set TWILIO_CALL_SID env var
+)
+```
+
+---
+
+#### Other transports (Plivo / Telnyx / WebSocket / SmallWebRTC / video avatars / …)
+
+For everything that isn't Daily or Twilio, SuperBryn does not record audio.
+Your transport (or carrier) owns the audio data — you record it there and
+pass the URL through:
+
+```python
+SuperbrynObserver(
+    agent_name="support-bot",
+    transport="plivo",                                  # or "telnyx", "websocket", etc.
+    recording_url="https://your-bucket/recordings/abc.mp3",
+)
+```
+
+Pick the option that fits your transport:
+
+- **Carrier-managed (Plivo / Telnyx / Exotel / Vonage)** — enable recording
+  on the carrier when you place the call, then fetch the URL from their REST
+  API after the call ends and pass it in via `recording_url=...`
+- **WebRTC / WebSocket / SmallWebRTC** — there is no recording API. If you
+  need audio, capture it on your own side (e.g. browser `MediaRecorder` or
+  server-side ffmpeg piping the WS payload to S3) and pass the URL through
+- **Video avatars (Tavus / HeyGen / Simli)** — use the avatar service's
+  built-in recording / replay feature and pass that URL through
+
+> **Why doesn't the SDK record for you?** Audio recording involves PII,
+> storage cost, and retention/compliance policy that should live with your
+> infrastructure, not ours. We keep the observer focused on transcripts,
+> metrics, latency, and usage — the things only the pipeline can produce.
+> Want first-class adapters for more carriers? Open an issue.
+
+---
+
+#### Fallback behavior
+
+If the auto-recording adapter fails to fetch a URL (missing env vars, network
+error, transport not yet finalized), the observer ships the call record
+without a `recording_url`. **Recording wiring never crashes your agent.**
 
 ### Custom Metadata
 
@@ -356,7 +569,7 @@ The observer auto-detects providers from the producing service's module path and
 
 **TTS:** ElevenLabs, Cartesia, PlayHT, Resemble AI, Murf, WellSaid Labs, Speechify, Sarvam, Azure, AWS Polly, Google Cloud
 
-**Transport:** Daily, Twilio, LiveKit, Vonage
+**Transport label (stamped on the call):** auto-derived from the transport object class name; common values include `daily`, `twilio`, `websocket`, `smallwebrtc`, `plivo`, `telnyx`. Pass a string explicitly if you want a custom label.
 
 If your provider isn't detected, it will show as `"unknown"` but the call still tracks normally.
 
