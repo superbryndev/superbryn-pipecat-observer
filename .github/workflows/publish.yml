@@ -9,6 +9,7 @@ on:
       - 'pyproject.toml'
       - 'MANIFEST.in'
       - 'README.md'
+  workflow_dispatch:
 
 jobs:
   publish:
