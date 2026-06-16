@@ -41,14 +41,14 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
 
     task = PipelineTask(
         pipeline,
+        observers=[
+            SuperbrynObserver(
+                agent_name="basic-pipecat-bot",
+                transport="fastapi_websocket",
+            ),
+        ],
         params=PipelineParams(
             enable_usage_metrics=True,
-            observers=[
-                SuperbrynObserver(
-                    agent_name="basic-pipecat-bot",
-                    transport="fastapi_websocket",
-                ),
-            ],
         ),
     )
 

@@ -90,9 +90,25 @@ def get_recording_adapter(transport: Any) -> RecordingAdapter | None:
             if tag in module or tag in cls_name.lower():
                 return AdapterCls(transport)
 
-        serializer = getattr(transport, "_serializer", None) or getattr(
-            transport, "serializer", None
+        # Pipecat's FastAPI/WebSocket transports stash the serializer inside
+        # their `params` object (`transport._params.serializer`), not as a
+        # direct attribute. We try both layouts so any transport that exposes
+        # a serializer — directly or via params — can still be sniffed.
+        serializer = (
+            getattr(transport, "_serializer", None)
+            or getattr(transport, "serializer", None)
         )
+        if serializer is None:
+            for params_attr in ("_params", "params"):
+                params_obj = getattr(transport, params_attr, None)
+                if params_obj is None:
+                    continue
+                serializer = getattr(params_obj, "serializer", None) or getattr(
+                    params_obj, "_serializer", None
+                )
+                if serializer is not None:
+                    break
+
         if serializer is not None:
             ser_module = (type(serializer).__module__ or "").lower()
             ser_cls = type(serializer).__name__.lower()

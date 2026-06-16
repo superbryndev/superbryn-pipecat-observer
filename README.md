@@ -49,14 +49,14 @@ from superbryn_pipecat_observer import SuperbrynObserver
 
 task = PipelineTask(
     pipeline,
+    observers=[
+        SuperbrynObserver(
+            agent_name="support-bot",
+            transport=daily_transport,                   # or twilio / plivo / vobiz transport
+        ),
+    ],
     params=PipelineParams(
         enable_usage_metrics=True,                       # required for token / TTS char counts
-        observers=[
-            SuperbrynObserver(
-                agent_name="support-bot",
-                transport=daily_transport,               # or twilio / plivo / vobiz transport
-            ),
-        ],
     ),
 )
 ```
@@ -80,15 +80,15 @@ from superbryn_pipecat_observer import SuperbrynObserver
 
 task = PipelineTask(
     pipeline,
+    observers=[
+        SuperbrynObserver(
+            agent_name="support-bot",
+            transport="plivo",                           # string label
+            recording_url="https://your-bucket/recordings/abc.mp3",
+        ),
+    ],
     params=PipelineParams(
         enable_usage_metrics=True,                       # required for token / TTS char counts
-        observers=[
-            SuperbrynObserver(
-                agent_name="support-bot",
-                transport="plivo",                       # string label
-                recording_url="https://your-bucket/recordings/abc.mp3",
-            ),
-        ],
     ),
 )
 ```
@@ -179,14 +179,14 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
     # Drop in the observer — that's the whole integration
     task = PipelineTask(
         pipeline,
+        observers=[
+            SuperbrynObserver(
+                agent_name="support-bot",
+                transport="websocket",
+            ),
+        ],
         params=PipelineParams(
             enable_usage_metrics=True,
-            observers=[
-                SuperbrynObserver(
-                    agent_name="support-bot",
-                    transport="websocket",
-                ),
-            ],
         ),
     )
 
@@ -272,7 +272,7 @@ Captured automatically when `enable_usage_metrics=True`:
 
 ## 🔍 How It Works
 
-1. **Pipeline Observation** - Registered via `PipelineParams(observers=[...])` — runs **alongside** your pipeline, not inside it
+1. **Pipeline Observation** - Registered via `PipelineTask(observers=[...])` — runs **alongside** your pipeline, not inside it
 2. **Frame Inspection** - `on_push_frame` watches every frame flowing between processors and aggregates by class name (so a Pipecat upgrade doesn't break it)
 3. **Auto-Detection** - Inspects the module path of each service (`*.stt.*`, `*.llm.*`, `*.tts.*`) to tag providers automatically
 4. **Webhook Delivery** - When `on_pipeline_finished` fires, builds a normalized call payload and POSTs it to SuperBryn
@@ -613,7 +613,7 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 Pipecat only emits `MetricsFrame`s when usage metrics are enabled at the task level:
 
 ```python
-PipelineParams(enable_usage_metrics=True, observers=[...])
+PipelineTask(pipeline, observers=[...], params=PipelineParams(enable_usage_metrics=True))
 ```
 
 Without this flag, you'll still get the transcript, latency, and provider detection — but `llm_input_tokens`, `llm_output_tokens`, and `tts_characters` will be `0`.
