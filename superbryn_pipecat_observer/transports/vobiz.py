@@ -1,18 +1,16 @@
 """
 Vobiz recording adapter.
 
-Vobiz is a Plivo-shaped India-focused voice platform (same
-`Account/{auth_id}/Call/...` URL convention) with two key differences:
+Vobiz is an India-focused voice platform. Recording lifecycle:
 
-  1. Auth uses custom headers (`X-Auth-ID` + `X-Auth-Token`), not Basic auth.
-  2. Recordings are listed via a global `Recording` endpoint filtered by
-     `call_uuid`, rather than a per-call `Call/{uuid}/Recording/` resource.
+  1. Auth uses the ``X-Auth-ID`` + ``X-Auth-Token`` header pair.
+  2. Recordings are listed via the global ``Recording`` endpoint, filtered
+     by ``call_uuid`` — there is no per-call recording resource.
 
-This adapter follows the same lifecycle as the Plivo / Twilio adapters:
-the customer enables recording on the Vobiz side (either by passing
-`record=true` in their answer XML or by POSTing to
-`/Call/{call_uuid}/Record/`), and the adapter only fetches the resulting
-URL after the call ends.
+The customer enables recording on the Vobiz side (either by setting
+``record=true`` in their answer XML or by POSTing to
+``/Call/{call_uuid}/Record/``). This adapter then waits until the call
+ends and fetches the resulting URL by polling the Recording endpoint.
 
 Required env vars:
     VOBIZ_AUTH_ID
@@ -122,10 +120,9 @@ class VobizRecordingAdapter:
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            # Vobiz follows the Plivo convention of returning
-                            # results under `objects`. Fall back to top-level
-                            # list / `recordings` for defensiveness across
-                            # API revisions.
+                            # Vobiz returns matching recordings under `objects`;
+                            # fall back to `recordings` or a bare list for
+                            # defensiveness across API revisions.
                             objects = (
                                 data.get("objects")
                                 or data.get("recordings")
@@ -171,24 +168,51 @@ class VobizRecordingAdapter:
 
 def _sniff_call_uuid(transport: Any) -> str | None:
     """
-    Best-effort CallUUID extraction from a Pipecat Vobiz-flavored transport.
+    Best-effort CallUUID extraction from a Pipecat Vobiz transport.
 
-    Vobiz mirrors Plivo's WebSocket payload shape (`callUuid`), so we
-    walk the same set of locations as the Plivo adapter.
+    Vobiz's WebSocket start event announces the CallUUID under the
+    ``callUuid`` / ``callId`` key, and Pipecat stores it on the
+    serializer once the start event is parsed. We walk every plausible
+    location:
+
+      - Direct attributes on the transport.
+      - The serializer, found at ``transport._serializer``,
+        ``transport.serializer``, or ``transport._params.serializer``
+        (the last is where ``FastAPIWebsocketTransport`` keeps it).
+      - The raw ``start`` event payload, if the transport happens to
+        stash it.
+
+    The attribute is named ``_call_id`` on Pipecat's μ-law 8 kHz WS
+    serializer and historically ``_call_uuid`` on some forks, so we
+    accept both naming conventions.
     """
     if transport is None:
         return None
 
-    candidates = ("call_uuid", "callUuid", "_call_uuid")
+    candidates = (
+        "call_uuid", "callUuid", "_call_uuid",
+        "call_id", "callId", "_call_id",
+    )
+
     for name in candidates:
         val = getattr(transport, name, None)
         if val:
             return str(val)
 
+    # Walk every plausible serializer location, including the FastAPI
+    # transport's nested `_params.serializer`.
+    serializers: list[Any] = []
     for ser_attr in ("_serializer", "serializer"):
         ser = getattr(transport, ser_attr, None)
-        if ser is None:
-            continue
+        if ser is not None:
+            serializers.append(ser)
+    params = getattr(transport, "_params", None) or getattr(transport, "params", None)
+    if params is not None:
+        ser = getattr(params, "serializer", None) or getattr(params, "_serializer", None)
+        if ser is not None:
+            serializers.append(ser)
+
+    for ser in serializers:
         for name in candidates:
             val = getattr(ser, name, None)
             if val:
@@ -198,7 +222,12 @@ def _sniff_call_uuid(transport: Any) -> str | None:
     if isinstance(raw, dict):
         start = raw.get("start") or raw
         if isinstance(start, dict):
-            val = start.get("callUuid") or start.get("call_uuid")
+            val = (
+                start.get("callUuid")
+                or start.get("call_uuid")
+                or start.get("callId")
+                or start.get("call_id")
+            )
             if val:
                 return str(val)
 

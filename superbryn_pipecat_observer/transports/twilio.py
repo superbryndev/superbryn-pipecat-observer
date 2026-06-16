@@ -173,11 +173,12 @@ def _sniff_call_sid(transport: Any) -> str | None:
     Pipecat doesn't expose this through a stable API, so we walk a few
     well-known locations:
 
-      - Direct attributes: `call_sid`, `callSid`, `_call_sid`
-      - Serializer attributes (Twilio serializer stores it once it sees the
-        WebSocket `start` event): `_serializer.call_sid`, etc.
-      - `transport._call_data["start"]["callSid"]` (older Pipecat versions
-        kept the raw start payload on the transport)
+      - Direct attributes: ``call_sid``, ``callSid``, ``_call_sid``
+      - The serializer, found at ``transport._serializer``,
+        ``transport.serializer``, or ``transport._params.serializer``
+        (where ``FastAPIWebsocketTransport`` keeps it).
+      - ``transport._call_data["start"]["callSid"]`` if the raw start
+        payload is stashed there.
     """
     if transport is None:
         return None
@@ -188,10 +189,18 @@ def _sniff_call_sid(transport: Any) -> str | None:
         if val:
             return str(val)
 
+    serializers: list[Any] = []
     for ser_attr in ("_serializer", "serializer"):
         ser = getattr(transport, ser_attr, None)
-        if ser is None:
-            continue
+        if ser is not None:
+            serializers.append(ser)
+    params = getattr(transport, "_params", None) or getattr(transport, "params", None)
+    if params is not None:
+        ser = getattr(params, "serializer", None) or getattr(params, "_serializer", None)
+        if ser is not None:
+            serializers.append(ser)
+
+    for ser in serializers:
         for name in candidates:
             val = getattr(ser, name, None)
             if val:
