@@ -41,7 +41,7 @@ pip install superbryn-pipecat-observer
 
 Add the observer to your `PipelineTask`. Pick the path that matches your transport — the observer auto-fetches the recording URL for Daily and Twilio, otherwise you pass it through.
 
-**Option A — Daily / Twilio (auto-fetch recording URL):**
+**Option A — Daily / Twilio / Plivo / Vobiz (auto-fetch recording URL):**
 
 ```python
 from pipecat.pipeline.task import PipelineTask, PipelineParams
@@ -54,15 +54,23 @@ task = PipelineTask(
         observers=[
             SuperbrynObserver(
                 agent_name="support-bot",
-                transport=daily_transport,               # or twilio_transport
+                transport=daily_transport,               # or twilio / plivo / vobiz transport
             ),
         ],
     ),
 )
-# requires DAILY_API_KEY (Daily) or TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN (Twilio)
 ```
 
-**Option B — Other transport (Plivo / Telnyx / WebSocket / SmallWebRTC / video avatars / …):**
+Set the credential pair for whichever transport you use:
+
+| Transport | Required env vars |
+|---|---|
+| Daily | `DAILY_API_KEY` |
+| Twilio | `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` |
+| Plivo | `PLIVO_AUTH_ID` + `PLIVO_AUTH_TOKEN` |
+| Vobiz | `VOBIZ_AUTH_ID` + `VOBIZ_AUTH_TOKEN` |
+
+**Option B — Other transport (Telnyx / Exotel / WebSocket / SmallWebRTC / video avatars / …):**
 
 SuperBryn does not record audio itself. Record on your side and pass the URL through:
 
@@ -84,6 +92,49 @@ task = PipelineTask(
     ),
 )
 ```
+
+**Option C — Multiple carriers, same agent (e.g. Twilio for global + Plivo / Vobiz for India):**
+
+Wrap observer creation in a small factory and branch on the carrier. Keep the same `agent_name` everywhere so calls roll up under one agent in SuperBryn — only the recording wiring differs per carrier:
+
+```python
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+from superbryn_pipecat_observer import SuperbrynObserver
+
+
+def build_observer(carrier: str, transport, call_id: str | None = None) -> SuperbrynObserver:
+    """Same agent_name across carriers = one rollup in the SuperBryn dashboard."""
+    if carrier == "twilio":
+        return SuperbrynObserver(
+            agent_name="support-bot",
+            transport=transport,                         # auto-fetch via Twilio REST
+            extra_metadata={"carrier": "twilio"},
+        )
+
+    # Plivo / Vobiz / Telnyx / Exotel / Vonage / … — fetch the URL yourself
+    return SuperbrynObserver(
+        agent_name="support-bot",
+        transport=carrier,                               # string label
+        recording_url=fetch_recording_url(carrier, call_id),
+        extra_metadata={"carrier": carrier},
+    )
+
+
+# Each carrier hits its own endpoint, so you already know which one called you.
+@app.websocket("/twilio/voice")
+async def twilio_handler(ws):
+    transport = FastAPIWebsocketTransport(ws, params=...)
+    observer = build_observer("twilio", transport)
+    await run_call(transport, observer)
+
+@app.websocket("/plivo/voice")
+async def plivo_handler(ws):
+    transport = FastAPIWebsocketTransport(ws, params=...)
+    observer = build_observer("plivo", transport, call_id=ws.query_params["CallUUID"])
+    await run_call(transport, observer)
+```
+
+Tag each call with `extra_metadata={"carrier": "..."}` so you can slice the dashboard by carrier / region without splitting the agent.
 
 **That's it!** 🎉 Every completed call shows up in your SuperBryn **Monitor → Calls** view within seconds of session end.
 
@@ -155,6 +206,12 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
 | `TWILIO_ACCOUNT_SID` | ⚪ Optional | Required only for Twilio auto-recording | - |
 | `TWILIO_AUTH_TOKEN` | ⚪ Optional | Required only for Twilio auto-recording | - |
 | `TWILIO_CALL_SID` | ⚪ Optional | Override if Twilio CallSid auto-detection fails | - |
+| `PLIVO_AUTH_ID` | ⚪ Optional | Required only for Plivo auto-recording | - |
+| `PLIVO_AUTH_TOKEN` | ⚪ Optional | Required only for Plivo auto-recording | - |
+| `PLIVO_CALL_UUID` | ⚪ Optional | Override if Plivo CallUUID auto-detection fails | - |
+| `VOBIZ_AUTH_ID` | ⚪ Optional | Required only for Vobiz auto-recording | - |
+| `VOBIZ_AUTH_TOKEN` | ⚪ Optional | Required only for Vobiz auto-recording | - |
+| `VOBIZ_CALL_UUID` | ⚪ Optional | Override if Vobiz CallUUID auto-detection fails | - |
 
 ### Setting Environment Variables
 
@@ -321,7 +378,9 @@ These show up on the call record so you can filter / segment by direction, area 
 |-----------|---------------|------------------|------------------|
 | **Daily** | `DailyTransport` | Voice/video calls via Daily Cloud (WebRTC) — most popular all-in-one | ✅ Native (Daily Cloud) |
 | **Twilio** | `FastAPIWebsocketTransport` + Twilio serializer | Phone calls via Twilio Media Streams — most common for telephony | ✅ Native (Twilio REST) |
-| **Plivo / Telnyx / Exotel / Vonage** | `FastAPIWebsocketTransport` + respective serializer | Other carrier telephony — same shape as Twilio | ⚠️ Manual (pass `recording_url=...` from carrier REST) |
+| **Plivo** | `FastAPIWebsocketTransport` + Plivo serializer | Carrier telephony, esp. India | ✅ Native (Plivo REST) |
+| **Vobiz** | `FastAPIWebsocketTransport` + Vobiz serializer | India SIP trunking + voice API | ✅ Native (Vobiz REST) |
+| **Telnyx / Exotel / Vonage** | `FastAPIWebsocketTransport` + respective serializer | Other carrier telephony — same shape as Twilio | ⚠️ Manual (pass `recording_url=...` from carrier REST) |
 | **Generic WebSocket** | `WebsocketServerTransport` | Custom apps with their own WS clients (Unity, mobile, etc.) | ❌ No recording (transport has no recording API) |
 | **SmallWebRTC** | `SmallWebRTCTransport` | Direct browser↔agent WebRTC (OpenAI Realtime-style demos) | ❌ No recording (transport has no recording API) |
 | **Tavus / HeyGen / Simli** | Video-avatar transports | Talking-head video agents | ⚠️ Manual (pass `recording_url=...` from avatar service) |
