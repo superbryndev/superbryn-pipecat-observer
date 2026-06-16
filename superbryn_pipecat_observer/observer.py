@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - import error surfaced clearly to the cal
 
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 
 
