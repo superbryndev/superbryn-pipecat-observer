@@ -190,8 +190,12 @@ def _sniff_call_uuid(transport: Any) -> str | None:
         return None
 
     candidates = (
-        "call_uuid", "callUuid", "_call_uuid",
-        "call_id", "callId", "_call_id",
+        "call_uuid",
+        "callUuid",
+        "_call_uuid",
+        "call_id",
+        "callId",
+        "_call_id",
     )
 
     for name in candidates:
