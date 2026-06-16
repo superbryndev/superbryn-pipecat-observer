@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'superbryn_pipecat_observer/**'
-      - 'pyproject.toml'
-      - 'MANIFEST.in'
-      - 'README.md'
   workflow_dispatch:
 
 jobs:
