@@ -27,6 +27,7 @@ from typing import Any
 
 from ._provider_detect import detect_provider_from_model
 from .config import AGENT_CONFIG, WEBHOOK_CONFIG
+from .transports import RecordingAdapter, get_recording_adapter
 
 try:
     from pipecat.observers.base_observer import BaseObserver, FramePushed
@@ -36,7 +37,7 @@ except Exception:  # pragma: no cover - import error surfaced clearly to the cal
 
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 
 
@@ -65,10 +66,11 @@ class SuperbrynObserver(BaseObserver):
         agent_id: str | None = None,
         api_key: str | None = None,
         webhook_url: str | None = None,
-        transport: str | None = None,
+        transport: Any | None = None,
         from_number: str | None = None,
         to_number: str | None = None,
         recording_url: str | None = None,
+        stereo_recording_url: str | None = None,
         extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.agent_name = agent_name
@@ -76,10 +78,38 @@ class SuperbrynObserver(BaseObserver):
         self.api_key = api_key or WEBHOOK_CONFIG["api_key"]
         self.webhook_url = webhook_url or WEBHOOK_CONFIG["url"]
 
-        self.transport = transport
+        # `transport` accepts either a plain string label (legacy 0.1.x usage)
+        # or a live Pipecat transport object. When an object is passed we try
+        # to auto-wire recording for the matching transport (Daily / Twilio).
+        # Unknown transports degrade gracefully — we still stamp a `transport`
+        # label on the payload and the caller can pass `recording_url=...`
+        # explicitly as before. SuperBryn never records audio itself; we only
+        # surface URLs produced by the transport.
+        self._transport_obj: Any | None = None
+        self._recording_adapter: RecordingAdapter | None = None
+        if transport is None or isinstance(transport, str):
+            self.transport = transport
+        else:
+            self._transport_obj = transport
+            self._recording_adapter = get_recording_adapter(transport)
+            if self._recording_adapter is not None:
+                self.transport = self._recording_adapter.transport_name
+                logger.info(
+                    "Auto-wired recording adapter for transport=%s",
+                    self.transport,
+                )
+            else:
+                # Stamp something useful so the dashboard shows what was used.
+                self.transport = type(transport).__name__.lower().replace("transport", "") or None
+                logger.info(
+                    "No recording adapter for transport class %s — manual recording_url required",
+                    type(transport).__name__,
+                )
+
         self.from_number = from_number
         self.to_number = to_number
         self.recording_url = recording_url
+        self.stereo_recording_url = stereo_recording_url
         self.extra_metadata = extra_metadata or {}
 
         self.session_id = str(uuid.uuid4())
@@ -117,11 +147,32 @@ class SuperbrynObserver(BaseObserver):
         self._call_start_ms = int(self.started_at.timestamp() * 1000)
         logger.info("SUPERBRYN_PIPECAT_CALL_STARTED: session_id=%s", self.session_id)
 
+        if self._recording_adapter is not None:
+            try:
+                await self._recording_adapter.start(self)
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "Recording adapter start failed (continuing without auto-recording): %s",
+                    exc,
+                )
+
     async def on_pipeline_finished(self) -> None:
         if self._sent:
             return
         self._sent = True
         self.ended_at = datetime.now(timezone.utc)
+
+        # Transport-native recording (Daily / Twilio). The adapter stamps
+        # `recording_url` on the observer when the transport produces one.
+        if self._recording_adapter is not None:
+            try:
+                await self._recording_adapter.finalize(self)
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "Recording adapter finalize failed (sending without recording URL): %s",
+                    exc,
+                )
+
         await self._send_webhook()
 
     # ── Frame observation ────────────────────────────────────────────────
@@ -322,6 +373,7 @@ class SuperbrynObserver(BaseObserver):
                 "to_number": self.to_number,
                 "transcript": {"turns": turns_with_text},
                 "recording_url": self.recording_url,
+                "stereo_recording_url": self.stereo_recording_url,
                 "metadata": {
                     "agent_id": self.agent_id,
                     "agent_name": self.agent_name,
