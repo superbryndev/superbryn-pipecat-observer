@@ -166,29 +166,49 @@ def _sniff_call_uuid(transport: Any) -> str | None:
     """
     Best-effort CallUUID extraction from a Pipecat Plivo-flavored transport.
 
-    Plivo's WebSocket start event carries `callUuid`. Pipecat's Plivo
-    serializer stashes it under various names depending on version, so we
-    walk a few well-known locations:
+    Plivo's WebSocket start event carries `callUuid`. We walk a few
+    well-known locations:
 
-      - Direct attributes: `call_uuid`, `callUuid`, `_call_uuid`
-      - Serializer attributes (set once the WS `start` event arrives):
-        `_serializer.call_uuid`, `.callUuid`, etc.
-      - `transport._call_data["start"]["callUuid"]` (some Pipecat versions
-        keep the raw start payload on the transport)
+      - Direct attributes on the transport.
+      - The serializer, found at either ``transport._serializer``,
+        ``transport.serializer``, or ``transport._params.serializer``
+        (the last is where FastAPIWebsocketTransport keeps it).
+      - The raw ``start`` event payload, if the transport happens to
+        stash it.
+
+    Pipecat's ``PlivoFrameSerializer`` stores the CallUUID as
+    ``_call_id`` rather than ``_call_uuid``, so we walk both naming
+    conventions to stay robust across versions.
     """
     if transport is None:
         return None
 
-    candidates = ("call_uuid", "callUuid", "_call_uuid")
+    candidates = (
+        "call_uuid",
+        "callUuid",
+        "_call_uuid",
+        "call_id",
+        "callId",
+        "_call_id",
+    )
+
     for name in candidates:
         val = getattr(transport, name, None)
         if val:
             return str(val)
 
+    serializers: list[Any] = []
     for ser_attr in ("_serializer", "serializer"):
         ser = getattr(transport, ser_attr, None)
-        if ser is None:
-            continue
+        if ser is not None:
+            serializers.append(ser)
+    params = getattr(transport, "_params", None) or getattr(transport, "params", None)
+    if params is not None:
+        ser = getattr(params, "serializer", None) or getattr(params, "_serializer", None)
+        if ser is not None:
+            serializers.append(ser)
+
+    for ser in serializers:
         for name in candidates:
             val = getattr(ser, name, None)
             if val:
@@ -198,7 +218,12 @@ def _sniff_call_uuid(transport: Any) -> str | None:
     if isinstance(raw, dict):
         start = raw.get("start") or raw
         if isinstance(start, dict):
-            val = start.get("callUuid") or start.get("call_uuid")
+            val = (
+                start.get("callUuid")
+                or start.get("call_uuid")
+                or start.get("callId")
+                or start.get("call_id")
+            )
             if val:
                 return str(val)
 
