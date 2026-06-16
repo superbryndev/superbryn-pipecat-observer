@@ -1,7 +1,7 @@
 """
 SuperbrynObserver — drop-in observer for Pipecat pipelines.
 
-Sits alongside the pipeline (passed via `PipelineParams(observers=[...])`),
+Sits alongside the pipeline (passed to `PipelineTask(observers=[...])`),
 accumulates per-call state from frames as they flow between processors,
 and POSTs a normalized call payload to SuperBryn's ingest endpoint when
 the pipeline finishes.
@@ -58,9 +58,9 @@ class SuperbrynObserver(BaseObserver):
 
         task = PipelineTask(
             pipeline,
+            observers=[SuperbrynObserver(agent_name="my-bot")],
             params=PipelineParams(
-                enable_usage_metrics=True,         # required for token/char counts
-                observers=[SuperbrynObserver(agent_name="my-bot")],
+                enable_usage_metrics=True,  # required for token/char counts
             ),
         )
     """
@@ -79,6 +79,17 @@ class SuperbrynObserver(BaseObserver):
         stereo_recording_url: str | None = None,
         extra_metadata: dict[str, Any] | None = None,
     ) -> None:
+        # Pipecat 1.3's BaseObserver.__init__ wires internal state (e.g.
+        # `_event_tasks`) that the pipeline relies on during cleanup. Without
+        # this call, end-of-pipeline triggers an AttributeError. We guard the
+        # call because in environments where pipecat isn't installed the
+        # `BaseObserver` import fallback uses plain `object`, whose
+        # `__init__` rejects keyword args.
+        try:
+            super().__init__()
+        except TypeError:
+            pass
+
         self.agent_name = agent_name
         self.agent_id = agent_id or AGENT_CONFIG["id"]
         self.api_key = api_key or WEBHOOK_CONFIG["api_key"]
