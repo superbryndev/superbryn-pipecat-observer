@@ -94,9 +94,8 @@ def get_recording_adapter(transport: Any) -> RecordingAdapter | None:
         # their `params` object (`transport._params.serializer`), not as a
         # direct attribute. We try both layouts so any transport that exposes
         # a serializer — directly or via params — can still be sniffed.
-        serializer = (
-            getattr(transport, "_serializer", None)
-            or getattr(transport, "serializer", None)
+        serializer = getattr(transport, "_serializer", None) or getattr(
+            transport, "serializer", None
         )
         if serializer is None:
             for params_attr in ("_params", "params"):
