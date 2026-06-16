@@ -37,8 +37,14 @@ except Exception:  # pragma: no cover - import error surfaced clearly to the cal
 
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
+
+# Frame class names that signal the call/pipeline is wrapping up. Pipecat 1.3
+# pushes one of these through `on_push_frame` when a session ends; we use
+# them as the trigger for our finalize step instead of the (now removed)
+# observer-level `on_pipeline_finished` lifecycle hook.
+_TERMINAL_FRAME_NAMES = ("EndFrame", "StopFrame", "CancelFrame")
 
 
 class SuperbrynObserver(BaseObserver):
@@ -157,13 +163,33 @@ class SuperbrynObserver(BaseObserver):
                 )
 
     async def on_pipeline_finished(self) -> None:
+        """Legacy Pipecat lifecycle hook.
+
+        Older Pipecat releases (< 1.3) called this on observers directly.
+        Pipecat 1.3 removed it from `BaseObserver` and only fires it as a
+        task-level event handler, so observers no longer get the hook
+        automatically. We keep this method for backward compatibility — it
+        simply delegates to the version-agnostic `_finalize_session()`,
+        which is also driven from `on_push_frame` on Pipecat 1.3+.
+        """
+        await self._finalize_session()
+
+    async def _finalize_session(self) -> None:
+        """Build the call payload and ship it to SuperBryn.
+
+        Idempotent: only runs once per observer instance, guarded by the
+        ``_sent`` flag. Safe to call from any number of triggers (legacy
+        observer lifecycle, terminal-frame detection in `on_push_frame`,
+        explicit shutdown hooks, …).
+        """
         if self._sent:
             return
         self._sent = True
         self.ended_at = datetime.now(timezone.utc)
 
-        # Transport-native recording (Daily / Twilio). The adapter stamps
-        # `recording_url` on the observer when the transport produces one.
+        # Transport-native recording (Daily / Twilio / Plivo / Vobiz).
+        # The adapter stamps `recording_url` on the observer when the
+        # transport produces one.
         if self._recording_adapter is not None:
             try:
                 await self._recording_adapter.finalize(self)
@@ -202,8 +228,14 @@ class SuperbrynObserver(BaseObserver):
                 self._capture_metrics(frame)
             elif cls_name == "UserStoppedSpeakingFrame":
                 self._mark_user_stop()
-            elif cls_name in ("EndFrame", "StopFrame", "CancelFrame"):
+            elif cls_name in _TERMINAL_FRAME_NAMES:
                 self._capture_end_reason(cls_name)
+                # Pipecat 1.3 stopped fanning out `on_pipeline_finished` to
+                # observers — so a terminal frame in the stream is now our
+                # primary signal that the call is over. `_finalize_session`
+                # is idempotent, so older Pipecat versions that also call
+                # `on_pipeline_finished` won't double-send.
+                await self._finalize_session()
 
             # First time we see a service frame, infer provider from module path
             source = getattr(data, "source", None)
