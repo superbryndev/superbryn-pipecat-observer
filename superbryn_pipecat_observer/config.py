@@ -36,9 +36,8 @@ WEBHOOK_CONFIG = {
     "api_key": os.getenv("SUPERBRYN_API_KEY", ""),
 }
 
-WEBHOOK_CONFIG["api_base_url"] = (
-    os.getenv("SUPERBRYN_API_BASE_URL")
-    or _derive_api_base_url(WEBHOOK_CONFIG["url"])
+WEBHOOK_CONFIG["api_base_url"] = os.getenv("SUPERBRYN_API_BASE_URL") or _derive_api_base_url(
+    WEBHOOK_CONFIG["url"]
 )
 
 _DEFAULT_AGENT_ID = "pipecat-agent"

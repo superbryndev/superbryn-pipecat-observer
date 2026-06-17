@@ -47,9 +47,7 @@ async def fetch_recording_upload_url(
     try:
         import aiohttp  # lazy: matches the import discipline in observer.py
     except ImportError:
-        logger.error(
-            "SUPERBRYN_PIPECAT_S3_NO_AIOHTTP: install aiohttp to enable direct S3 upload"
-        )
+        logger.error("SUPERBRYN_PIPECAT_S3_NO_AIOHTTP: install aiohttp to enable direct S3 upload")
         return None
 
     url = f"{api_base_url.rstrip('/')}/api/recording-upload-url"
@@ -94,9 +92,7 @@ async def upload_wav_via_presigned(
     try:
         import aiohttp
     except ImportError:
-        logger.error(
-            "SUPERBRYN_PIPECAT_S3_NO_AIOHTTP: install aiohttp to enable direct S3 upload"
-        )
+        logger.error("SUPERBRYN_PIPECAT_S3_NO_AIOHTTP: install aiohttp to enable direct S3 upload")
         return False
 
     try:
