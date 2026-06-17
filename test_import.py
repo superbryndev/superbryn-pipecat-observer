@@ -8,6 +8,10 @@ Validates:
   - Payload builder produces the canonical SuperBryn shape
   - Provider detection covers the major LLM / STT / TTS names
   - Observer no-ops fail-open when no API key is set
+  - Transport arg behaviour: string labels and transport objects both
+    produce a metadata label, neither pulls in a per-carrier adapter
+    (those were removed in 0.5.0 — audio capture is now in-pipeline,
+    transport-agnostic).
 """
 
 import asyncio
@@ -53,113 +57,52 @@ def test_observer_no_api_key_is_noop() -> None:
     os.environ.pop("SUPERBRYN_API_KEY", None)
     obs = SuperbrynObserver(agent_name="no-key", api_key="")
 
-    # Should not raise even when no API key is present.
     asyncio.run(obs._send_webhook())
 
 
-def test_transport_adapter_detection() -> None:
-    """Class-name + serializer-module detection picks the right adapter per transport."""
-    from superbryn_pipecat_observer.transports import (
-        DailyRecordingAdapter,
-        PlivoRecordingAdapter,
-        TwilioRecordingAdapter,
-        VobizRecordingAdapter,
-        get_recording_adapter,
-    )
+def test_transport_arg_string_label() -> None:
+    """A string `transport=` lands on the payload metadata unchanged."""
+    from superbryn_pipecat_observer import SuperbrynObserver
 
-    class DailyTransport:  # noqa: D401 — minimal stub
-        pass
-
-    class _TwilioFrameSerializer:
-        __module__ = "pipecat.serializers.twilio"
-
-    class _PlivoFrameSerializer:
-        __module__ = "pipecat.serializers.plivo"
-
-    class _VobizFrameSerializer:
-        __module__ = "pipecat.serializers.vobiz"
-
-    def _ws_transport_with(serializer_cls):  # noqa: ANN001
-        class FastAPIWebsocketTransport:
-            def __init__(self) -> None:
-                self._serializer = serializer_cls()
-
-        return FastAPIWebsocketTransport()
-
-    class RawWebRTCTransport:
-        pass
-
-    class SmallWebRTCTransport:
-        pass
-
-    class WebsocketServerTransport:
-        pass
-
-    assert isinstance(get_recording_adapter(DailyTransport()), DailyRecordingAdapter)
-    assert isinstance(
-        get_recording_adapter(_ws_transport_with(_TwilioFrameSerializer)),
-        TwilioRecordingAdapter,
-    )
-    assert isinstance(
-        get_recording_adapter(_ws_transport_with(_PlivoFrameSerializer)),
-        PlivoRecordingAdapter,
-    )
-    assert isinstance(
-        get_recording_adapter(_ws_transport_with(_VobizFrameSerializer)),
-        VobizRecordingAdapter,
-    )
-    # Transports with no recording API → no adapter (caller passes recording_url manually).
-    assert get_recording_adapter(RawWebRTCTransport()) is None
-    assert get_recording_adapter(SmallWebRTCTransport()) is None
-    assert get_recording_adapter(WebsocketServerTransport()) is None
-    # Legacy string label must not produce an adapter.
-    assert get_recording_adapter("daily") is None
-    assert get_recording_adapter("plivo") is None
-    assert get_recording_adapter("vobiz") is None
-    assert get_recording_adapter(None) is None
+    obs = SuperbrynObserver(agent_name="t", api_key="x", transport="vobiz")
+    assert obs.transport == "vobiz"
+    assert obs._transport_obj is None
+    assert obs._build_payload()["call"]["metadata"]["transport"] == "vobiz"
 
 
-def test_plivo_and_vobiz_adapters_warn_when_env_missing() -> None:
-    """Adapters must not crash when their env credentials are absent."""
-    import os as _os
-
-    from superbryn_pipecat_observer.transports import (
-        PlivoRecordingAdapter,
-        VobizRecordingAdapter,
-    )
-
-    for var in (
-        "PLIVO_AUTH_ID",
-        "PLIVO_AUTH_TOKEN",
-        "PLIVO_CALL_UUID",
-        "VOBIZ_AUTH_ID",
-        "VOBIZ_AUTH_TOKEN",
-        "VOBIZ_CALL_UUID",
-    ):
-        _os.environ.pop(var, None)
-
-    # Just instantiating must not raise; observer fail-open behaviour is
-    # exercised in `test_lifecycle_fail_open_on_adapter_error`.
-    PlivoRecordingAdapter(transport=object())
-    VobizRecordingAdapter(transport=object())
-
-
-def test_observer_accepts_transport_object() -> None:
-    """Passing a transport object wires the adapter; string label still works."""
+def test_transport_arg_object_derives_label() -> None:
+    """An object `transport=` keeps a reference (for pipeline output lookup)
+    and produces a normalized lowercase label on the payload."""
     from superbryn_pipecat_observer import SuperbrynObserver
 
     class DailyTransport:
         pass
 
-    obs_obj = SuperbrynObserver(agent_name="t", api_key="x", transport=DailyTransport())
-    assert obs_obj.transport == "daily"
-    assert obs_obj._recording_adapter is not None
-    assert obs_obj._recording_adapter.transport_name == "daily"
+    t = DailyTransport()
+    obs = SuperbrynObserver(agent_name="t", api_key="x", transport=t)
+    assert obs.transport == "daily"
+    assert obs._transport_obj is t
 
-    # Backwards-compat: string label still works, no adapter.
-    obs_str = SuperbrynObserver(agent_name="t", api_key="x", transport="custom")
-    assert obs_str.transport == "custom"
-    assert obs_str._recording_adapter is None
+
+def test_no_legacy_recording_adapter_state() -> None:
+    """The per-carrier polling flow was removed in 0.5.0 — neither the
+    submodule nor the observer fields should exist any more."""
+    import importlib
+
+    from superbryn_pipecat_observer import SuperbrynObserver
+
+    obs = SuperbrynObserver(agent_name="t", api_key="x", transport="daily")
+    assert not hasattr(obs, "_recording_adapter")
+    assert not hasattr(obs, "_backfill_recording")
+
+    try:
+        importlib.import_module("superbryn_pipecat_observer.transports")
+    except ImportError:
+        return
+    raise AssertionError(
+        "superbryn_pipecat_observer.transports should not be importable — "
+        "per-carrier recording adapters were removed in 0.5.0."
+    )
 
 
 def test_payload_includes_stereo_recording_url() -> None:
@@ -174,42 +117,6 @@ def test_payload_includes_stereo_recording_url() -> None:
     payload = obs._build_payload()
     assert payload["call"]["recording_url"] == "https://r/mono.mp3"
     assert payload["call"]["stereo_recording_url"] == "https://r/stereo.mp3"
-
-
-def test_lifecycle_fail_open_on_adapter_error() -> None:
-    """If the adapter raises, the observer still sends the webhook."""
-    from superbryn_pipecat_observer import SuperbrynObserver
-
-    class BrokenAdapter:
-        transport_name = "broken"
-        transport = None
-
-        async def start(self, _observer):  # noqa: D401, ANN001
-            raise RuntimeError("boom on start")
-
-        async def finalize(self, _observer):  # noqa: D401, ANN001
-            raise RuntimeError("boom on finalize")
-
-    obs = SuperbrynObserver(agent_name="t", api_key="")
-    obs._recording_adapter = BrokenAdapter()
-
-    # Neither hook should propagate the adapter exception.
-    asyncio.run(obs.on_pipeline_started())
-    asyncio.run(obs.on_pipeline_finished())
-
-
-def test_no_recording_module_exposed() -> None:
-    """The in-pipeline recording subpackage was removed in favor of transport-native URLs only."""
-    import importlib
-
-    try:
-        importlib.import_module("superbryn_pipecat_observer.recording")
-    except ImportError:
-        return
-    raise AssertionError(
-        "superbryn_pipecat_observer.recording should not be importable — "
-        "in-pipeline recording was removed."
-    )
 
 
 def test_observer_rejects_record_audio_kwarg() -> None:
@@ -233,11 +140,9 @@ if __name__ == "__main__":
     test_payload_shape_minimal()
     test_provider_detect()
     test_observer_no_api_key_is_noop()
-    test_transport_adapter_detection()
-    test_observer_accepts_transport_object()
+    test_transport_arg_string_label()
+    test_transport_arg_object_derives_label()
+    test_no_legacy_recording_adapter_state()
     test_payload_includes_stereo_recording_url()
-    test_lifecycle_fail_open_on_adapter_error()
-    test_no_recording_module_exposed()
     test_observer_rejects_record_audio_kwarg()
-    test_plivo_and_vobiz_adapters_warn_when_env_missing()
     print("All smoke tests passed.")
