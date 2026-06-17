@@ -10,14 +10,13 @@ Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI a
 ## Features
 
 - **Drop-in integration** — wrap your pipeline with one call, every call shows up in SuperBryn.
-- **Transport-agnostic recording** — same code captures audio on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket. No carrier credentials needed.
+- **Transport-agnostic** — same code works on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket. No carrier credentials needed.
 - **Precise transcripts** — speaker turns with timestamps, confidence scores, and per-turn bot latency.
 - **Usage metrics** — LLM tokens (in / out), STT seconds, TTS characters, captured automatically from Pipecat's `MetricsFrame`.
 - **Latency tracking** — average and p95 response time between user stop and bot start.
 - **Provider auto-detection** — LLM / STT / TTS provider, model, and voice ID inferred from the service modules in your pipeline.
 - **Tool-call capture** — both real Pipecat tools (`FunctionCallInProgressFrame` / `FunctionCallResultFrame`) and Anthropic-style `<tool_use>` prompt tools.
-- **UAT / simulation mode** — `track_and_create_task` skips audio + suppresses billing for non-production runs.
-- **Deferred upload** — opt-in consent gate (`defer_upload=True`) so audio only leaves the process after explicit approval.
+- **UAT / simulation mode** — `track_and_create_task` suppresses billing for non-production runs.
 - **Session log capture** — buffer INFO+ logs from the call window and attach them to the payload.
 - **Custom metadata** — attach any key/value bag to the call record; mutable mid-session.
 - **Fail-open** — if anything in telemetry fails, your pipeline keeps running. Telemetry never crashes a call.
@@ -65,9 +64,9 @@ pip install superbryn-pipecat-observer
 
 3. Run a call. The session shows up in SuperBryn within seconds of the call ending.
 
-That's it. Audio is captured in-pipeline, so the same code works on every transport — no carrier credentials, no per-carrier wiring.
+That's it. The same code works on every transport — no carrier credentials, no per-carrier wiring.
 
-For UAT / simulation calls that shouldn't be billed or analyzed, use `track_and_create_task` instead — same signature, no audio capture.
+For UAT / simulation calls that shouldn't be billed or analyzed, use `track_and_create_task` instead — same signature.
 
 ## What Gets Tracked
 
@@ -103,12 +102,6 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 - Anthropic-style prompt tool calls — `<tool_use>{...}</tool_use>` blocks extracted from bot turns and lifted onto `call.tool_calls` (XML is stripped from the visible transcript)
 - Each record carries `function_name`, `arguments`, `result`, `timestamp_ms`, and `tool_call_id`
 
-### Audio Recording
-- Stereo by default — channel 0 = user, channel 1 = bot
-- Mono available by passing `num_channels=1`
-- Same capture works on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket — no carrier API needed
-- Skipped entirely in `track_and_create_task` mode
-
 ### Session Logs (opt-in)
 - INFO+ records from the agent process during the call window
 - Bounded by `max_log_records` (default 1000) so a chatty agent can't blow up the payload
@@ -118,9 +111,8 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 
 1. **Pipeline observation.** The observer is registered via `PipelineTask(observers=[...])` — it runs **alongside** your pipeline, not inside it.
 2. **Frame inspection.** `on_push_frame` watches every frame flowing between processors and aggregates by class name, so a Pipecat upgrade doesn't break it.
-3. **In-pipeline audio capture.** When you call `observe_and_create_task`, the SDK inserts a Pipecat `AudioBufferProcessor` just before `transport.output()`. Both user-input audio and TTS output flow through it, so the same code records the call on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket transports — no carrier API or recording credentials required.
-4. **Auto-detection.** The observer inspects each service's module path (`pipecat.services.<provider>.<role>`) to tag LLM / STT / TTS provider, model, and voice ID automatically.
-5. **End-of-session delivery.** When the call ends (`EndFrame` / `CancelFrame` / transport disconnect), the SDK finalizes the recording, builds a normalized call payload, and POSTs it to SuperBryn.
+3. **Auto-detection.** The observer inspects each service's module path (`pipecat.services.<provider>.<role>`) to tag LLM / STT / TTS provider, model, and voice ID automatically.
+4. **End-of-session delivery.** When the call ends (`EndFrame` / `CancelFrame` / transport disconnect), the SDK builds a normalized call payload and POSTs it to SuperBryn.
 
 ## Webhook Payload
 
@@ -154,7 +146,6 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
         }
       ]
     },
-    "stereo_recording_url": "https://...s3.amazonaws.com/...wav",
     "metadata": {
       "agent_id": "support-bot",
       "agent_name": "support-bot",
@@ -192,7 +183,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 }
 ```
 
-`tool_calls` is included only when the LLM invoked one or more tools. Mono recordings use `recording_url` instead of `stereo_recording_url`.
+`tool_calls` is included only when the LLM invoked one or more tools.
 
 ## Troubleshooting
 
@@ -218,7 +209,6 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 | `SUPERBRYN_PIPECAT_HTTP_*` | Non-2xx response from the SuperBryn server |
 | `SUPERBRYN_PIPECAT_ERROR` | Network / exception during delivery |
 | `SUPERBRYN_PIPECAT_MISSING_AIOHTTP` | `aiohttp` not installed in the runtime |
-| `SUPERBRYN_PIPECAT_CONSENT_TIMEOUT` | `defer_upload=True` but neither `start_audio_upload()` nor `abort()` was called within 30 s |
 | `SUPERBRYN_PIPECAT_SESSION_DISCARDED` | Session aborted — no webhook sent |
 
 ### Common errors
@@ -230,7 +220,6 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 | `SUPERBRYN_PIPECAT_AUTH_FAILED (403)` | Expired / disabled key | Generate a new API key |
 | `SUPERBRYN_PIPECAT_MISSING_AIOHTTP` | `aiohttp` missing | `pip install aiohttp>=3.9.0` |
 | `SUPERBRYN_PIPECAT_PAYLOAD_TOO_LARGE` | Transcript / logs too large | Trim `custom_metadata` or pass `capture_logs=False` |
-| `audio recorder produced an empty WAV` | Audio processor saw no frames | Make sure you used `observe_and_create_task` (or placed `AudioBufferProcessor` *before* `transport.output()`) |
 
 ### Missing usage metrics
 
