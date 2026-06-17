@@ -33,7 +33,7 @@ def test_payload_shape_minimal() -> None:
 
     assert payload["event"] == "call.completed"
     assert payload["sdk_version"].startswith("@superbryn/pipecat-observer@")
-    assert payload["call"]["session_id"]
+    assert payload["call"]["id"]
     assert payload["call"]["metadata"]["agent_name"] == "test-bot"
     assert "transcript" in payload["call"]
     assert "usage" in payload["call"]
