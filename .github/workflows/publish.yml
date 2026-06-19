@@ -9,6 +9,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -53,8 +55,12 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add pyproject.toml superbryn_pipecat_observer/observer.py .bumpversion.cfg README.md
-          git commit -m "Bump version [skip ci]" || echo "No changes to commit"
-          git push || echo "Nothing to push"
+          if git diff --cached --quiet; then
+            echo "No version changes to commit"
+          else
+            git commit -m "Bump version [skip ci]"
+            git push
+          fi
 
       - name: Build package
         run: python -m build

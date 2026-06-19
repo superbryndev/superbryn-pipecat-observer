@@ -1,7 +1,7 @@
 # SuperBryn Pipecat Observer
 
 [![PyPI version](https://img.shields.io/pypi/v/superbryn-pipecat-observer.svg)](https://pypi.org/project/superbryn-pipecat-observer/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
 
@@ -24,7 +24,7 @@ Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI a
 
 ## Prerequisites
 
-- Python **3.10+**
+- Python **3.11+**
 - An active Pipecat pipeline (`pipecat-ai >= 0.0.50` recommended for the 1.3+ observer lifecycle)
 - `aiohttp >= 3.9.0` (installed as a transitive dependency)
 - A SuperBryn API key from [https://app.superbryn.com/api-keys](https://app.superbryn.com/api-keys)
@@ -123,7 +123,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.6.3",
+  "sdk_version": "@superbryn/pipecat-observer@0.6.4",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -161,7 +161,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.6.3",
+      "pipeline_version": "@superbryn/pipecat-observer@0.6.4",
       "mode": "observe"
     },
     "usage": {
