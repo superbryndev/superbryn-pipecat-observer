@@ -123,7 +123,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.6.6",
+  "sdk_version": "@superbryn/pipecat-observer@0.6.7",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -161,7 +161,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.6.6",
+      "pipeline_version": "@superbryn/pipecat-observer@0.6.7",
       "mode": "observe"
     },
     "usage": {
