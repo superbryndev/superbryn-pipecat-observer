@@ -16,7 +16,7 @@ Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI a
 - **Latency tracking** — average and p95 response time between user stop and bot start.
 - **Provider auto-detection** — LLM / STT / TTS provider, model, and voice ID inferred from the service modules in your pipeline.
 - **Tool-call capture** — both real Pipecat tools (`FunctionCallInProgressFrame` / `FunctionCallResultFrame`) and Anthropic-style `<tool_use>` prompt tools.
-- **UAT / simulation mode** — `track_and_create_task` suppresses billing for non-production runs.
+- **UAT / simulation mode** — `simulate_and_create_task` suppresses billing for non-production runs.
 - **Session log capture** — buffer INFO+ logs from the call window and attach them to the payload.
 - **Custom metadata** — attach any key/value bag to the call record; mutable mid-session.
 - **Fail-open** — if anything in telemetry fails, your pipeline keeps running. Telemetry never crashes a call.
@@ -54,7 +54,7 @@ pip install superbryn-pipecat-observer
        agent_name="support-bot",
    )
 
-   task = observer.observe_and_create_task(
+   task = observer.monitor_and_create_task(
        pipeline,
        transport=transport,
    )
@@ -66,7 +66,11 @@ pip install superbryn-pipecat-observer
 
 That's it. The same code works on every transport — no carrier credentials, no per-carrier wiring.
 
-For UAT / simulation calls that shouldn't be billed or analyzed, use `track_and_create_task` instead — same signature.
+For UAT / simulation calls that shouldn't be billed or analyzed, use `simulate_and_create_task` instead — same signature.
+
+> **Note:** earlier releases exposed these as `observe_and_create_task` /
+> `track_and_create_task`. Those names still work but emit a
+> `DeprecationWarning` and will be removed in `0.8.0`.
 
 ## What Gets Tracked
 
@@ -79,7 +83,7 @@ For UAT / simulation calls that shouldn't be billed or analyzed, use `track_and_
 - Empty turns are filtered out before send
 
 ### Usage Metrics
-Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, set automatically by `observe_and_create_task`):
+Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, set automatically by `monitor_and_create_task`):
 - **LLM** — input tokens, output tokens, model, provider
 - **TTS** — character count, model, provider, voice ID
 - **STT** — seconds of audio processed, model, provider (with a VAD-derived fallback when the provider doesn't report)
@@ -119,7 +123,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.6.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.6.2",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -157,7 +161,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.6.0",
+      "pipeline_version": "@superbryn/pipecat-observer@0.6.2",
       "mode": "observe"
     },
     "usage": {
@@ -223,7 +227,7 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 
 ### Missing usage metrics
 
-Pipecat only emits `MetricsFrame`s when usage metrics are enabled. `observe_and_create_task` / `track_and_create_task` set this for you. If you build your own `PipelineTask`, pass `enable_usage_metrics=True`:
+Pipecat only emits `MetricsFrame`s when usage metrics are enabled. `monitor_and_create_task` / `simulate_and_create_task` set this for you. If you build your own `PipelineTask`, pass `enable_usage_metrics=True`:
 
 ```python
 PipelineTask(
