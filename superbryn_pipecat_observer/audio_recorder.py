@@ -310,7 +310,7 @@ class SuperbrynAudioRecorder:
         if had_buffered_audio:
             try:
                 await asyncio.wait_for(self._chunk_written.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "SuperbrynAudioRecorder: timed out waiting for on_audio_data to flush "
                     "(buffers had data but writer never fired)"
