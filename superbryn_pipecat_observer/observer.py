@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
@@ -390,23 +391,27 @@ class SuperbrynObserver(BaseObserver):
 
     # ── High-level entrypoints (recommended) ─────────────────────────────
     #
-    # These mirror the Cekura SDK surface (`observe_pipeline` / `track_pipeline`
-    # / `observe_and_create_task` / `track_and_create_task`) so customers can
-    # swap SDKs with minimal code churn. They wrap pipeline mutation +
-    # `PipelineTask` construction + lifecycle handler registration into a
-    # single call, hiding the AudioBufferProcessor + observer wiring.
+    # `monitor_*` is production (records audio + ships to SuperBryn).
+    # `simulate_*` is UAT / scenario runs (transcript + metrics only, no
+    # audio, no billing). Both wrap pipeline mutation + `PipelineTask`
+    # construction + lifecycle handler registration into a single call,
+    # hiding the AudioBufferProcessor + observer wiring.
     #
     # Production:
-    #     task = observer.observe_and_create_task(pipeline, context,
+    #     task = observer.monitor_and_create_task(pipeline, context,
     #                                             runner_args=runner_args,
     #                                             transport=transport)
     #
     # UAT / simulation (no audio):
-    #     task = observer.track_and_create_task(pipeline, context,
-    #                                           runner_args=runner_args,
-    #                                           transport=transport)
+    #     task = observer.simulate_and_create_task(pipeline, context,
+    #                                              runner_args=runner_args,
+    #                                              transport=transport)
+    #
+    # The earlier `observe_*` / `track_*` names are kept as deprecated
+    # aliases for one minor release (removal target: 0.8.0). They emit a
+    # ``DeprecationWarning`` and delegate to the new names.
 
-    def observe_pipeline(
+    def monitor_pipeline(
         self,
         pipeline: Any,
         _context: Any = None,
@@ -417,8 +422,8 @@ class SuperbrynObserver(BaseObserver):
         num_channels: int = 2,
         defer_upload: bool = False,
     ) -> Any:
-        """Insert audio capture into a Pipecat ``Pipeline`` and return the
-        rebuilt pipeline.
+        """Production mode: insert audio capture into a Pipecat ``Pipeline``
+        and return the rebuilt pipeline.
 
         The ``AudioBufferProcessor`` is placed immediately *before* the
         transport's output processor — see ``_rebuild_pipeline_with``
@@ -426,10 +431,9 @@ class SuperbrynObserver(BaseObserver):
         already supplied to the constructor we reuse it; otherwise a
         stereo (user-left, bot-right) recorder is created on the fly.
 
-        ``_context`` is accepted for API parity with the Cekura SDK but
-        is currently unused — we don't yet introspect aggregators for
-        channel assignment; we always default to stereo with the
-        convention `left=user`, `right=bot`.
+        ``_context`` is accepted for forward compatibility (aggregator
+        introspection for channel assignment) but is currently unused —
+        we default to stereo with the convention `left=user`, `right=bot`.
         """
         if not self._enabled:
             return pipeline
@@ -447,14 +451,14 @@ class SuperbrynObserver(BaseObserver):
             # incompatible). Skip the rebuild — observer still captures
             # transcripts via on_push_frame.
             logger.warning(
-                "observe_pipeline: AudioBufferProcessor unavailable; falling back to track mode"
+                "monitor_pipeline: AudioBufferProcessor unavailable; falling back to simulate mode"
             )
             self.audio_recorder = None
             return pipeline
 
         return self._rebuild_pipeline_with(pipeline, self.audio_recorder.processor)
 
-    def track_pipeline(
+    def simulate_pipeline(
         self,
         pipeline: Any,
         _context: Any = None,
@@ -475,13 +479,14 @@ class SuperbrynObserver(BaseObserver):
 
         self._apply_runtime_overrides(runner_args, session_id, custom_metadata)
 
-        # Track mode explicitly disables any pre-wired recorder so users
-        # can flip between observe/track without rebuilding the observer.
+        # Simulate mode explicitly disables any pre-wired recorder so users
+        # can flip between monitor/simulate without rebuilding the observer.
+        # The wire-format `mode` value stays "track" for backend compatibility.
         self.audio_recorder = None
         self.extra_metadata.setdefault("mode", "track")
         return pipeline
 
-    def observe_and_create_task(
+    def monitor_and_create_task(
         self,
         pipeline: Any,
         context: Any = None,
@@ -499,7 +504,7 @@ class SuperbrynObserver(BaseObserver):
 
         Equivalent to::
 
-            pipeline = observer.observe_pipeline(pipeline, context,
+            pipeline = observer.monitor_pipeline(pipeline, context,
                                                  runner_args=runner_args,
                                                  session_id=session_id,
                                                  custom_metadata=custom_metadata,
@@ -513,7 +518,7 @@ class SuperbrynObserver(BaseObserver):
         individually. Extra ``PipelineTask`` kwargs are forwarded
         as-is.
         """
-        pipeline = self.observe_pipeline(
+        pipeline = self.monitor_pipeline(
             pipeline,
             context,
             runner_args=runner_args,
@@ -525,7 +530,7 @@ class SuperbrynObserver(BaseObserver):
         task = self._build_pipeline_task(pipeline, pipeline_task_kwargs)
         return self.register_task_handlers(task, transport=transport)
 
-    def track_and_create_task(
+    def simulate_and_create_task(
         self,
         pipeline: Any,
         context: Any = None,
@@ -536,8 +541,8 @@ class SuperbrynObserver(BaseObserver):
         custom_metadata: dict[str, Any] | None = None,
         **pipeline_task_kwargs: Any,
     ) -> Any:
-        """Single-step UAT setup. See :meth:`observe_and_create_task`."""
-        pipeline = self.track_pipeline(
+        """Single-step UAT setup. See :meth:`monitor_and_create_task`."""
+        pipeline = self.simulate_pipeline(
             pipeline,
             context,
             runner_args=runner_args,
@@ -546,6 +551,48 @@ class SuperbrynObserver(BaseObserver):
         )
         task = self._build_pipeline_task(pipeline, pipeline_task_kwargs)
         return self.register_task_handlers(task, transport=transport)
+
+    # ── Deprecated aliases (target removal: 0.8.0) ───────────────────────
+
+    def observe_pipeline(self, *args: Any, **kwargs: Any) -> Any:
+        """Deprecated: use :meth:`monitor_pipeline` instead."""
+        warnings.warn(
+            "SuperbrynObserver.observe_pipeline is deprecated; "
+            "use monitor_pipeline instead. Will be removed in 0.8.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.monitor_pipeline(*args, **kwargs)
+
+    def track_pipeline(self, *args: Any, **kwargs: Any) -> Any:
+        """Deprecated: use :meth:`simulate_pipeline` instead."""
+        warnings.warn(
+            "SuperbrynObserver.track_pipeline is deprecated; "
+            "use simulate_pipeline instead. Will be removed in 0.8.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.simulate_pipeline(*args, **kwargs)
+
+    def observe_and_create_task(self, *args: Any, **kwargs: Any) -> Any:
+        """Deprecated: use :meth:`monitor_and_create_task` instead."""
+        warnings.warn(
+            "SuperbrynObserver.observe_and_create_task is deprecated; "
+            "use monitor_and_create_task instead. Will be removed in 0.8.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.monitor_and_create_task(*args, **kwargs)
+
+    def track_and_create_task(self, *args: Any, **kwargs: Any) -> Any:
+        """Deprecated: use :meth:`simulate_and_create_task` instead."""
+        warnings.warn(
+            "SuperbrynObserver.track_and_create_task is deprecated; "
+            "use simulate_and_create_task instead. Will be removed in 0.8.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.simulate_and_create_task(*args, **kwargs)
 
     def register_task_handlers(self, task: Any, *, transport: Any | None = None) -> Any:
         """Register the observer's finalize hook on a Pipecat 1.3+ ``PipelineTask``.
@@ -1613,10 +1660,13 @@ class SuperbrynObserver(BaseObserver):
             if t.get("text", "").strip()
         ]
 
-        # `mode` defaults to "observe" so older callers (and the manual /
-        # advanced flow) keep their existing semantics. `track_pipeline`
-        # already sets `extra_metadata["mode"] = "track"`; we don't
-        # override that here.
+        # Wire-format `mode` defaults to "observe" (production) so older
+        # callers and the manual/advanced flow keep their existing
+        # semantics. `simulate_pipeline` already sets
+        # `extra_metadata["mode"] = "track"`; we don't override it here.
+        # The string values "observe"/"track" are kept for backend
+        # compatibility even though the public method names are now
+        # monitor_*/simulate_*.
         metadata: dict[str, Any] = {
             "agent_id": self.agent_id,
             "agent_name": self.agent_name,

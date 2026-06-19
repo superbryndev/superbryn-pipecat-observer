@@ -49,7 +49,7 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
         agent_name="basic-pipecat-bot",
     )
 
-    task = observer.observe_and_create_task(
+    task = observer.monitor_and_create_task(
         pipeline,
         transport=transport,
     )
