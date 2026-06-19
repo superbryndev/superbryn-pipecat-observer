@@ -27,7 +27,7 @@ import os
 import re
 import uuid
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -358,7 +358,7 @@ class SuperbrynObserver(BaseObserver):
         if not self._enabled:
             return
 
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
         self._call_start_ms = int(self.started_at.timestamp() * 1000)
         logger.info("SUPERBRYN_PIPECAT_CALL_STARTED: session_id=%s", self.session_id)
 
@@ -749,7 +749,7 @@ class SuperbrynObserver(BaseObserver):
                     message = str(record.msg)
                 observer._captured_logs.append(
                     {
-                        "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                        "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
                         "level": record.levelname,
                         "name": record.name,
                         "message": message,
@@ -993,7 +993,7 @@ class SuperbrynObserver(BaseObserver):
         if self._sent:
             return
         self._sent = True
-        self.ended_at = datetime.now(timezone.utc)
+        self.ended_at = datetime.now(UTC)
 
         # Always stop log capture as part of finalize — even when deferred
         # uploads make us wait below, the log set is what the user already
@@ -1013,7 +1013,7 @@ class SuperbrynObserver(BaseObserver):
                 # PipelineRunner forever. 30 s mirrors the audio-upload
                 # timeout we already enforce on the S3 PUT step.
                 await asyncio.wait_for(self._deferred_release.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "SUPERBRYN_PIPECAT_CONSENT_TIMEOUT: no start_audio_upload()/abort() "
                     "within 30s — discarding session %s",
@@ -1158,7 +1158,7 @@ class SuperbrynObserver(BaseObserver):
     # ── Capture helpers ──────────────────────────────────────────────────
 
     def _now_ms(self) -> int:
-        return int(datetime.now(timezone.utc).timestamp() * 1000) - (self._call_start_ms or 0)
+        return int(datetime.now(UTC).timestamp() * 1000) - (self._call_start_ms or 0)
 
     def _capture_user_turn(self, frame: Any) -> None:
         text = (getattr(frame, "text", "") or "").strip()
