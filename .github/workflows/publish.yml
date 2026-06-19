@@ -9,6 +9,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -20,6 +22,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
 
       - name: Install dependencies
         run: |
@@ -48,13 +53,20 @@ jobs:
           NEW_VERSION=$(python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])")
           echo "Publishing version: $NEW_VERSION"
 
+      - name: Refresh uv.lock with new version
+        run: uv lock
+
       - name: Commit version bump
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add pyproject.toml superbryn_pipecat_observer/observer.py .bumpversion.cfg README.md
-          git commit -m "Bump version [skip ci]" || echo "No changes to commit"
-          git push || echo "Nothing to push"
+          git add pyproject.toml superbryn_pipecat_observer/observer.py .bumpversion.cfg README.md uv.lock
+          if git diff --cached --quiet; then
+            echo "No version changes to commit"
+          else
+            git commit -m "Bump version [skip ci]"
+            git push
+          fi
 
       - name: Build package
         run: python -m build
