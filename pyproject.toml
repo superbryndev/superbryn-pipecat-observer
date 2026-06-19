@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superbryn-pipecat-observer"
-version = "0.6.8"
+version = "0.6.9"
 description = "Track and evaluate Pipecat agent sessions with automatic metrics, transcripts, and usage analytics"
 readme = "README.md"
 requires-python = ">=3.11"
