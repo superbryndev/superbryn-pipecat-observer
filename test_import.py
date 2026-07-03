@@ -135,6 +135,136 @@ def test_observer_rejects_record_audio_kwarg() -> None:
         raise AssertionError(f"SuperbrynObserver should reject {kwargs}")
 
 
+# ── Bot-turn capture regressions ─────────────────────────────────────────
+#
+# These reproduce two production bugs seen with the Anthropic+Cartesia
+# pipeline in `pipecat-agent`:
+#   1. Streaming LLM tokens after the first were silently dropped
+#      because `_looks_like_bot_text` gated on "agent turn with empty
+#      text", which becomes False the moment the first token lands.
+#   2. When Cartesia (a word-timestamp TTS) emits `TTSTextFrame` per
+#      spoken word *and* the LLM streams `LLMTextFrame`s for the same
+#      response, both were captured with the fix from (1) — duplicating
+#      the whole utterance in the transcript.
+#
+# The observer must now:
+#   * Capture every streamed token of a single bot response.
+#   * Lock a turn to the first text source (LLM or TTS) and drop the
+#     other, so the same content is never counted twice.
+#   * Still capture a `TTSSpeakFrame`-injected greeting (LLM bypassed)
+#     via the TTS's word-level `TTSTextFrame`s.
+
+
+def _make_frame_pushed(frame, source):
+    """Build a fake `FramePushed` payload that mirrors what Pipecat delivers."""
+    from dataclasses import make_dataclass
+
+    FramePushed = make_dataclass("FramePushed", ["frame", "source"])
+    return FramePushed(frame=frame, source=source)
+
+
+def _make_service(module_path):
+    """Build a fake service whose `__module__` matches a real Pipecat plugin."""
+    return type(f"Fake_{module_path.replace('.', '_')}", (), {"__module__": module_path})()
+
+
+def test_streaming_llm_tokens_are_all_captured() -> None:
+    """Regression: an LLM response that streams as multiple `LLMTextFrame`s
+    must end up as a single agent turn containing the full concatenated text.
+    Previously only the first token was captured."""
+    from pipecat.frames.frames import (
+        LLMFullResponseEndFrame,
+        LLMFullResponseStartFrame,
+        LLMTextFrame,
+    )
+
+    from superbryn_pipecat_observer import SuperbrynObserver
+
+    obs = SuperbrynObserver(agent_name="stream", api_key="sb_test")
+    llm = _make_service("pipecat.services.anthropic.llm")
+
+    async def drive() -> None:
+        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseStartFrame(), llm))
+        for token in ["Hello", " there", ",", " how", " can", " I", " help", "?"]:
+            await obs.on_push_frame(_make_frame_pushed(LLMTextFrame(text=token), llm))
+        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseEndFrame(), llm))
+
+    asyncio.run(drive())
+
+    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    assert len(agent_turns) == 1
+    assert agent_turns[0]["text"] == "Hello there, how can I help?"
+
+
+def test_llm_stream_and_tts_word_frames_do_not_double_count() -> None:
+    """Regression: a word-timestamp TTS (Cartesia) emits `TTSTextFrame` per
+    spoken word for content the LLM already streamed. The observer must
+    capture from exactly one source (LLM here) and drop the other."""
+    from pipecat.frames.frames import (
+        LLMFullResponseEndFrame,
+        LLMFullResponseStartFrame,
+        LLMTextFrame,
+        TTSTextFrame,
+    )
+    from pipecat.utils.text.base_text_aggregator import AggregationType
+
+    from superbryn_pipecat_observer import SuperbrynObserver
+
+    obs = SuperbrynObserver(agent_name="dup", api_key="sb_test")
+    llm = _make_service("pipecat.services.anthropic.llm")
+    tts = _make_service("pipecat.services.cartesia.tts")
+
+    async def drive() -> None:
+        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseStartFrame(), llm))
+        for token in ["Hello", " there"]:
+            await obs.on_push_frame(_make_frame_pushed(LLMTextFrame(text=token), llm))
+        for word in ["Hello", "there"]:
+            frame = TTSTextFrame(text=word, aggregated_by=AggregationType.TOKEN)
+            await obs.on_push_frame(_make_frame_pushed(frame, tts))
+        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseEndFrame(), llm))
+
+    asyncio.run(drive())
+
+    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    assert len(agent_turns) == 1
+    assert agent_turns[0]["text"] == "Hello there"
+
+
+def test_tts_speak_greeting_is_captured_via_tts_words() -> None:
+    """Regression: a `TTSSpeakFrame` injection (pre-baked greeting) has no
+    LLM stream. The observer must open the bot turn on `TTSSpeakFrame`
+    early enough that the TTS service's word-level `TTSTextFrame`s land
+    inside it — the greeting text was previously missing entirely."""
+    from pipecat.frames.frames import (
+        BotStoppedSpeakingFrame,
+        TTSSpeakFrame,
+        TTSTextFrame,
+    )
+    from pipecat.utils.text.base_text_aggregator import AggregationType
+
+    from superbryn_pipecat_observer import SuperbrynObserver
+
+    obs = SuperbrynObserver(agent_name="greet", api_key="sb_test")
+    tts = _make_service("pipecat.services.cartesia.tts")
+    pipeline_source = _make_service("pipecat.pipeline.pipeline")
+
+    async def drive() -> None:
+        greeting = "Hi, welcome to the cafe."
+        greeting_frame = TTSSpeakFrame(text=greeting)
+        await obs.on_push_frame(_make_frame_pushed(greeting_frame, pipeline_source))
+        await obs.on_push_frame(_make_frame_pushed(greeting_frame, pipeline_source))
+        for word in ["Hi,", "welcome", "to", "the", "cafe."]:
+            frame = TTSTextFrame(text=word, aggregated_by=AggregationType.TOKEN)
+            await obs.on_push_frame(_make_frame_pushed(frame, tts))
+        await obs.on_push_frame(_make_frame_pushed(BotStoppedSpeakingFrame(), tts))
+
+    asyncio.run(drive())
+
+    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    assert len(agent_turns) == 1, f"expected 1 agent turn, got {len(agent_turns)}"
+    assert agent_turns[0]["text"] == "Hi, welcome to the cafe."
+
+
 if __name__ == "__main__":
     test_package_imports()
     test_payload_shape_minimal()
@@ -145,4 +275,7 @@ if __name__ == "__main__":
     test_no_legacy_recording_adapter_state()
     test_payload_includes_stereo_recording_url()
     test_observer_rejects_record_audio_kwarg()
+    test_streaming_llm_tokens_are_all_captured()
+    test_llm_stream_and_tts_word_frames_do_not_double_count()
+    test_tts_speak_greeting_is_captured_via_tts_words()
     print("All smoke tests passed.")

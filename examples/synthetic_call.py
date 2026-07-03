@@ -27,7 +27,9 @@ os.environ.setdefault("AGENT_ID", "synthetic-support-bot")
 
 from pipecat.frames.frames import (  # noqa: E402
     BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     EndFrame,
+    LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     MetricsFrame,
     TextFrame,
@@ -178,6 +180,8 @@ async def main() -> None:
             ]
         ),
     )
+    await push(observer, llm, LLMFullResponseEndFrame())
+    await push(observer, tts, BotStoppedSpeakingFrame())
 
     # ── Turn 2: user gives order number ──
     await asyncio.sleep(0.08)
@@ -231,6 +235,8 @@ async def main() -> None:
             ]
         ),
     )
+    await push(observer, llm, LLMFullResponseEndFrame())
+    await push(observer, tts, BotStoppedSpeakingFrame())
 
     # ── Turn 3: user says thanks ──
     await asyncio.sleep(0.06)
@@ -280,6 +286,8 @@ async def main() -> None:
             ]
         ),
     )
+    await push(observer, llm, LLMFullResponseEndFrame())
+    await push(observer, tts, BotStoppedSpeakingFrame())
 
     # ── End of call ──
     await push(observer, llm, EndFrame())

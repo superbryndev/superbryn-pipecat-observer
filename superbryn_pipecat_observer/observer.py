@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - import error surfaced clearly to the cal
 
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.6.9"
+__version__ = "0.6.10"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 
 # Frame class names that signal the call/pipeline is wrapping up. Pipecat 1.3
@@ -276,6 +276,27 @@ class SuperbrynObserver(BaseObserver):
         # producing multiple turns when the start/stop frames propagate
         # across several pipeline links.
         self._bot_turn_open: bool = False
+
+        # Per-turn first-source-wins guard for bot-text capture.
+        #
+        # Pipecat emits bot text in TWO independent streams:
+        #   1. LLM services push `LLMTextFrame` tokens as the model streams
+        #      its response (source = pipecat.services.<vendor>.llm).
+        #   2. TTS services with word-timestamp support (Cartesia,
+        #      ElevenLabs, …) push `TTSTextFrame` per word during audio
+        #      playback (source = pipecat.services.<vendor>.tts).
+        #
+        # For a single LLM-driven response BOTH streams carry the same
+        # content, so capturing from both would duplicate every word in
+        # the transcript. For a `TTSSpeakFrame`-injected utterance (a
+        # pre-baked greeting queued via `task.queue_frames`) the LLM
+        # stream is silent — only TTS emits text.
+        #
+        # We resolve this by locking each turn to the first source that
+        # contributes text: LLM if the LLM ran, TTS if only TTS ran. The
+        # lock is cleared in `_close_bot_turn` so the next turn is free
+        # to pick its own source.
+        self._current_turn_text_source: str | None = None
 
         # Tool / function-call invocations made by the LLM during the call.
         # Pipecat emits `FunctionCallInProgressFrame` when the LLM decides to
@@ -1111,6 +1132,27 @@ class SuperbrynObserver(BaseObserver):
                 # service itself).
                 if "pipecat.services." in source_module and "stt" in source_module:
                     self._capture_user_turn(frame)
+            elif cls_name == "TTSSpeakFrame":
+                # ``TTSSpeakFrame`` is a direct text-to-TTS injection that
+                # bypasses the LLM entirely (e.g. a pre-baked greeting
+                # queued at call start via ``task.queue_frames``). Pipecat
+                # never emits ``LLMFullResponseStartFrame`` for this path,
+                # so nothing opens a bot turn early. Meanwhile the TTS
+                # service starts pushing ``TTSTextFrame``s (with the actual
+                # word-level text) before the output transport gets around
+                # to emitting ``BotStartedSpeakingFrame`` — those early
+                # ``TTSTextFrame``s arrive at the observer with
+                # ``_bot_turn_open=False`` and would be dropped.
+                #
+                # We open the bot turn *early* here so the subsequent
+                # ``TTSTextFrame``s land in it. We deliberately DO NOT
+                # capture the ``TTSSpeakFrame`` text itself — otherwise it
+                # would double-count with the ``TTSTextFrame``s that carry
+                # the same content. ``_mark_bot_response_start`` is
+                # idempotent via ``_bot_turn_open``, so a ``TTSSpeakFrame``
+                # observed on multiple pipeline hops (no source filter is
+                # applied) doesn't open duplicate turns.
+                self._mark_bot_response_start()
             elif cls_name in _BOT_TEXT_FRAME_NAMES and self._looks_like_bot_text(frame):
                 # Same dedupe problem for bot text. ``LLMTextFrame`` (and
                 # subclasses) flow from the LLM service through TTS,
@@ -1122,7 +1164,17 @@ class SuperbrynObserver(BaseObserver):
                 if "pipecat.services." in source_module and (
                     "llm" in source_module or "tts" in source_module
                 ):
-                    self._capture_bot_turn(frame)
+                    # First-source-wins per turn. Word-timestamp TTS
+                    # services (Cartesia, ElevenLabs) emit `TTSTextFrame`
+                    # per spoken word for the *same* content the LLM
+                    # already streamed as `LLMTextFrame`s — capturing
+                    # both duplicates every word. Lock the turn to the
+                    # first source we see and drop the other.
+                    source_kind = "llm" if "llm" in source_module else "tts"
+                    if self._current_turn_text_source is None:
+                        self._current_turn_text_source = source_kind
+                    if self._current_turn_text_source == source_kind:
+                        self._capture_bot_turn(frame)
             elif cls_name in ("LLMFullResponseStartFrame", "BotStartedSpeakingFrame"):
                 self._mark_bot_response_start()
             elif cls_name in ("LLMFullResponseEndFrame", "BotStoppedSpeakingFrame"):
@@ -1239,6 +1291,9 @@ class SuperbrynObserver(BaseObserver):
         if not self._bot_turn_open:
             return
         self._bot_turn_open = False
+        # Release the source lock so the next turn is free to pick either
+        # LLM or TTS as its text source (whichever contributes first).
+        self._current_turn_text_source = None
         for turn in reversed(self.transcript_turns):
             if turn["speaker"] == "agent" and turn.get("_open"):
                 self._extract_prompt_tool_calls(turn)
@@ -1330,6 +1385,10 @@ class SuperbrynObserver(BaseObserver):
         if self._bot_turn_open:
             return
         self._bot_turn_open = True
+        # Defensive reset: normally `_close_bot_turn` clears the source
+        # lock, but if the previous turn was orphaned (e.g. call
+        # cancelled mid-response) we may still be holding the old lock.
+        self._current_turn_text_source = None
         now_ms = self._now_ms()
         latency = now_ms - self._last_user_end_ms if self._last_user_end_ms is not None else None
         if latency is not None and latency >= 0:
@@ -1914,5 +1973,10 @@ class SuperbrynObserver(BaseObserver):
         A `TextFrame` can come from many places. We treat it as a bot turn
         only if it appears between LLM-response-start and the next user
         transcription — i.e. there's an open bot turn waiting for text.
+
+        We gate on `_bot_turn_open` rather than checking for an empty-text
+        agent turn. The old empty-text check fired False after the very first
+        streaming token was appended, silently dropping every subsequent
+        `LLMTextFrame` chunk for that turn.
         """
-        return any(t["speaker"] == "agent" and not t["text"] for t in self.transcript_turns)
+        return self._bot_turn_open
