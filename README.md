@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.7.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.7.1-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -157,7 +157,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.7.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.7.1",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -195,7 +195,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.7.0",
+      "pipeline_version": "@superbryn/pipecat-observer@0.7.1",
       "mode": "observe"
     },
     "usage": {
