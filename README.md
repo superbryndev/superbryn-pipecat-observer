@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.6.11-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.7.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -111,6 +111,40 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 - Bounded by `max_log_records` (default 1000) so a chatty agent can't blow up the payload
 - Disable with `capture_logs=False`
 
+## Agent Config Sync (opt-in)
+
+Push your agent's configuration to SuperBryn as a reviewable draft. Requires an **agent-scoped** API key; nothing syncs unless you call it explicitly:
+
+```python
+from superbryn_pipecat_observer import sync_config
+
+sync_config(
+    pipeline,
+    api_key="sk_agent_...",           # or SUPERBRYN_API_KEY
+    identity={"name": "Support Agent", "type": "inbound", "agent_modality": "voice"},
+    behavior={"prompt": open("prompt.txt").read()},
+    policy_guardrails=open("guardrails.md").read(),
+)
+```
+
+The helper walks the pipeline's processors to fill the `llm` / `stt` / `tts` / `voice` blocks automatically, and reads the LLM context to fill `behavior.prompt` (the system message) and `tools` (the advertised function schemas) — explicit `behavior=` / `tools=` overrides always win (public attributes only — your provider API keys are never read). The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_pipeline(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
+
+Override sections accept exactly the fields of the canonical manifest schema (unknown keys raise `ValueError` locally — the endpoint rejects them anyway):
+
+| Keyword | Fields |
+|---|---|
+| `identity` | `name`, `type` (`inbound`/`outbound`), `agent_modality` (`voice`/`chat`), `description`, `pain_point`, `gender`, `age`, `dob` |
+| `behavior` | `prompt`, `flow` |
+| `tools` | list of `{name, description, schema, server: {type, url}}` |
+| `language` | `primary_language`, `additional_languages: [{code, priority}]` |
+| `telephony` | `phone_number`, `ivr_config: {enabled, number}` |
+
+Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`.
+
+For the sections the pipeline can't expose, pass `scan_root="path/to/project"` to statically scan your source for them (`agent_name=`, `phone_number=`, `POLICY_GUARDRAILS = "..."`, `concurrency_calls=`, ...). Precedence per section: explicit kwarg > runtime extraction > source scan. The scan is read-only and best-effort — see `superbryn_pipecat_observer/codescan.py`.
+
+Docs: https://docs.superbryn.com/advanced/agent-sync
+
 ## How It Works
 
 1. **Pipeline observation.** The observer is registered via `PipelineTask(observers=[...])` — it runs **alongside** your pipeline, not inside it.
@@ -123,7 +157,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.6.11",
+  "sdk_version": "@superbryn/pipecat-observer@0.7.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -161,7 +195,7 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.6.11",
+      "pipeline_version": "@superbryn/pipecat-observer@0.7.0",
       "mode": "observe"
     },
     "usage": {
