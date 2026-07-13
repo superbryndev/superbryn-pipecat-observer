@@ -11,8 +11,11 @@ SuperBryn dashboard); org-scoped keys are rejected by the endpoint. The
 pushed manifest lands as a pending draft that a human approves in the
 review UI — syncing never changes the live agent directly.
 
-Extractors read public attributes only. API keys and other secrets held by
-Pipecat service objects are never read or transmitted.
+Extraction reads a fixed allow-list of configuration attributes on the
+pipeline services — including private fields such as ``_settings``,
+``_model`` and ``_voice_id`` where Pipecat services keep their settings.
+Credential attributes (API keys, tokens, secrets) are never part of that
+list and are never read or transmitted.
 """
 
 from __future__ import annotations
@@ -220,8 +223,59 @@ def _provider_from_module(module: str) -> str | None:
     return None
 
 
+# Attribute names commonly used by custom wrapper classes to hold the real
+# pipecat service instance. Probed in order; the first present wins.
+_INNER_SERVICE_ATTRS = (
+    "_service",
+    "_llm",
+    "_stt",
+    "_tts",
+    "_inner",
+    "_wrapped",
+    "_base",
+    "service",
+)
+
+_NON_SERVICE_TYPES = (list, tuple, dict, set, str, bytes, int, float, bool)
+
+
+def _unwrap_service(processor: Any) -> Any:
+    """Descend through custom wrapper classes to the real pipecat service.
+
+    Customer code sometimes wraps a service (e.g. a sanitising TTS wrapper
+    holding the real one in ``self._service``). The wrapper's module path is
+    the customer's, not ``pipecat.services.<provider>``, so extraction on the
+    wrapper yields nothing. Walk common inner attributes (cycle-safe) until a
+    ``pipecat.services.*`` instance is found or there is nothing to follow.
+    """
+    visited: set[int] = set()
+    current = processor
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        module = type(current).__module__ or ""
+        if "pipecat.services." in module:
+            return current
+        next_inner: Any = None
+        for attr in _INNER_SERVICE_ATTRS:
+            candidate = getattr(current, attr, None)
+            if (
+                candidate is not None
+                and candidate is not current
+                and not isinstance(candidate, _NON_SERVICE_TYPES)
+            ):
+                next_inner = candidate
+                break
+        if next_inner is None:
+            return current
+        current = next_inner
+    return current
+
+
 def _extract_service(processor: Any, role: str) -> dict[str, Any] | None:
     """Extract a {provider, model[, voice_id]} block from a pipecat service."""
+    if processor is None:
+        return None
+    processor = _unwrap_service(processor)
     module = type(processor).__module__ or ""
     if "pipecat.services." not in module or role not in module:
         return None
@@ -259,18 +313,50 @@ def _extract_service(processor: Any, role: str) -> dict[str, Any] | None:
     return block or None
 
 
+# Attributes holding child processors on compound processors.
+# ``_processors`` — Pipeline; ``_pipelines`` — ParallelPipeline (and its
+# subclasses ServiceSwitcher / LLMSwitcher, whose branches wrap each service
+# as Filter → Service → Filter inside a nested Pipeline).
+_CHILD_LIST_ATTRS = ("_processors", "_pipelines", "processors")
+
+
 def _walk_processors(pipeline: Any) -> list[Any]:
-    """Flatten a Pipecat pipeline into a processor list (best effort)."""
-    processors = getattr(pipeline, "_processors", None) or getattr(pipeline, "processors", None)
-    if not processors:
-        return []
+    """Recursively flatten a Pipecat pipeline into a processor list (best effort).
+
+    Descends through nested ``Pipeline`` / ``ParallelPipeline`` /
+    ``ServiceSwitcher`` structures (cycle-safe), so services buried inside
+    switcher branches are found too. Order follows branch order — for a
+    ``ServiceSwitcher`` the primary (initially active) service comes first.
+    """
     flat: list[Any] = []
-    for p in processors:
-        flat.append(p)
-        nested = getattr(p, "_processors", None)
-        if nested:
-            flat.extend(nested)
-    return flat
+    visited: set[int] = set()
+
+    def _walk(node: Any) -> None:
+        if node is None or id(node) in visited:
+            return
+        visited.add(id(node))
+        flat.append(node)
+        for attr in _CHILD_LIST_ATTRS:
+            children = getattr(node, attr, None)
+            if isinstance(children, (list, tuple)) and children:
+                for child in children:
+                    _walk(child)
+                break
+
+    _walk(pipeline)
+    return flat[1:] if flat and flat[0] is pipeline else flat
+
+
+def _switcher_services(processor: Any) -> list[Any]:
+    """The member services of a ServiceSwitcher/LLMSwitcher, or [] otherwise.
+
+    Switchers keep their members in ``_services`` (primary first). Plain
+    services and other processors don't have it.
+    """
+    services = getattr(processor, "_services", None)
+    if isinstance(services, (list, tuple)) and services:
+        return list(services)
+    return []
 
 
 def _find_llm_context(pipeline: Any) -> Any:
@@ -373,7 +459,6 @@ def build_manifest_from_pipeline(
     policy_guardrails: str | None = None,
     additional_details: str | None = None,
     concurrency_calls: int | None = None,
-    scan_root: str | None = None,
 ) -> dict[str, Any]:
     """Build an AgentSyncManifest dict from a Pipecat pipeline.
 
@@ -386,12 +471,7 @@ def build_manifest_from_pipeline(
 
     Everything the pipeline genuinely can't know (identity, telephony,
     guardrails, concurrency, ...) is supplied through the keyword
-    overrides — or discovered by a static source scan when ``scan_root``
-    (a file or project directory) is given. Precedence per section:
-    explicit keyword override > runtime extraction > source scan. See
-    :mod:`superbryn_pipecat_observer.codescan` for what the scan looks
-    for (``agent_name=``, ``phone_number=``, ``POLICY_GUARDRAILS = ...``,
-    ``concurrency_calls=``, ...).
+    overrides.
 
     Override shapes mirror the canonical manifest schema exactly (see the
     TypedDicts at the top of this module):
@@ -420,10 +500,20 @@ def build_manifest_from_pipeline(
 
     try:
         for processor in _walk_processors(pipeline):
+            members = _switcher_services(processor)
             for role in ("llm", "stt", "tts"):
                 if role in manifest:
                     continue
-                block = _extract_service(processor, role)
+                if members:
+                    # ServiceSwitcher / LLMSwitcher: first member is the
+                    # primary, the next one is reported as the fallback.
+                    block = _extract_service(members[0], role)
+                    if block and len(members) > 1:
+                        fallback = _extract_service(members[1], role)
+                        if fallback:
+                            block["fallback"] = fallback
+                else:
+                    block = _extract_service(processor, role)
                 if block:
                     manifest[role] = block
     except Exception as exc:  # noqa: BLE001 — never break the customer's agent
@@ -442,29 +532,9 @@ def build_manifest_from_pipeline(
         except Exception as exc:  # noqa: BLE001 — never break the customer's agent
             logger.debug("context extraction failed: %s", exc)
 
-    if scan_root is not None:
-        try:
-            from .codescan import scan_source_config
-
-            scanned = scan_source_config(scan_root)
-            if identity is None and "identity" in scanned:
-                identity = scanned["identity"]
-            if behavior is None and "behavior" in scanned:
-                behavior = scanned["behavior"]
-            if telephony is None and "telephony" in scanned:
-                telephony = scanned["telephony"]
-            if policy_guardrails is None and "policy_guardrails" in scanned:
-                policy_guardrails = scanned["policy_guardrails"]
-            if additional_details is None and "additional_details" in scanned:
-                additional_details = scanned["additional_details"]
-            if concurrency_calls is None and "concurrency_calls" in scanned:
-                concurrency_calls = scanned["concurrency_calls"]
-        except Exception as exc:  # noqa: BLE001 — never break the customer's agent
-            logger.debug("source scan failed: %s", exc)
-
     tts_block = manifest.get("tts")
     if isinstance(tts_block, dict) and tts_block.get("voice_id"):
-        manifest["voice"] = {
+        voice_block = {
             k: v
             for k, v in (
                 ("provider", tts_block.get("provider")),
@@ -472,6 +542,19 @@ def build_manifest_from_pipeline(
             )
             if v
         }
+        tts_fallback = tts_block.get("fallback")
+        if isinstance(tts_fallback, dict) and tts_fallback.get("voice_id"):
+            voice_fallback = {
+                k: v
+                for k, v in (
+                    ("provider", tts_fallback.get("provider")),
+                    ("voice_id", tts_fallback["voice_id"]),
+                )
+                if v
+            }
+            if voice_fallback:
+                voice_block["fallback"] = voice_fallback
+        manifest["voice"] = voice_block
 
     config: dict[str, Any] = {}
     if identity is not None:

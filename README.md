@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.7.1-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.8.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -127,7 +127,7 @@ sync_config(
 )
 ```
 
-The helper walks the pipeline's processors to fill the `llm` / `stt` / `tts` / `voice` blocks automatically, and reads the LLM context to fill `behavior.prompt` (the system message) and `tools` (the advertised function schemas) — explicit `behavior=` / `tools=` overrides always win (public attributes only — your provider API keys are never read). The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_pipeline(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
+The helper walks the pipeline's processors — recursing into nested pipelines, `ParallelPipeline` branches, and `ServiceSwitcher` / `LLMSwitcher` members, and unwrapping custom wrapper classes — to fill the `llm` / `stt` / `tts` / `voice` blocks automatically. For switchers, the primary (initially active) service fills the block and the next member is reported in its `fallback` sub-block. It also reads the LLM context to fill `behavior.prompt` (the system message) and `tools` (the advertised function schemas) — explicit `behavior=` / `tools=` overrides always win. Extraction reads a fixed allow-list of configuration attributes (including private fields like `_settings`, `_model`, `_voice_id` where Pipecat services store their settings); credential attributes such as provider API keys are never part of that list and are never read or transmitted. The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_pipeline(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
 
 Override sections accept exactly the fields of the canonical manifest schema (unknown keys raise `ValueError` locally — the endpoint rejects them anyway):
 
@@ -139,9 +139,7 @@ Override sections accept exactly the fields of the canonical manifest schema (un
 | `language` | `primary_language`, `additional_languages: [{code, priority}]` |
 | `telephony` | `phone_number`, `ivr_config: {enabled, number}` |
 
-Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`.
-
-For the sections the pipeline can't expose, pass `scan_root="path/to/project"` to statically scan your source for them (`agent_name=`, `phone_number=`, `POLICY_GUARDRAILS = "..."`, `concurrency_calls=`, ...). Precedence per section: explicit kwarg > runtime extraction > source scan. The scan is read-only and best-effort — see `superbryn_pipecat_observer/codescan.py`.
+Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`. Sections the pipeline can't expose (identity, telephony, guardrails, ...) are supplied through these explicit overrides.
 
 Docs: https://docs.superbryn.com/advanced/agent-sync
 
@@ -157,7 +155,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.7.1",
+  "sdk_version": "@superbryn/pipecat-observer@0.8.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -195,7 +193,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.7.1",
+      "pipeline_version": "@superbryn/pipecat-observer@0.8.0",
       "mode": "observe"
     },
     "usage": {

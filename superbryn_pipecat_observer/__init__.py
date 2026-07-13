@@ -6,7 +6,6 @@ at end of session. See README.md for usage.
 """
 
 from .audio_recorder import SuperbrynAudioRecorder
-from .codescan import scan_source_config
 from .config_sync import (
     BehaviorConfig,
     IdentityConfig,
@@ -31,7 +30,6 @@ __all__ = [
     "__version__",
     "async_sync_config",
     "build_manifest_from_pipeline",
-    "scan_source_config",
     "sync_config",
     "sync_manifest",
 ]
