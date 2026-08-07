@@ -19,6 +19,9 @@ Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI a
 - **UAT / simulation mode** — `simulate_and_create_task` suppresses billing for non-production runs.
 - **Session log capture** — buffer INFO+ logs from the call window and attach them to the payload.
 - **Custom metadata** — attach any key/value bag to the call record; mutable mid-session.
+- **Turn-detection latency** — end-to-end turn-completion timing and confidence, the hidden part of response latency.
+- **Per-service timings** — real TTFB / TTFA (with silence padding split out) / processing time, broken down by service.
+- **Pipeline diagnostics** — error frames, interruptions, VAD segments, DTMF, transport lifecycle, frame histogram.
 - **Fail-open** — if anything in telemetry fails, your pipeline keeps running. Telemetry never crashes a call.
 - **Frame-version tolerant** — frames are matched by class name, so a Pipecat upgrade doesn't hard-break the observer.
 
@@ -111,6 +114,41 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 - Bounded by `max_log_records` (default 1000) so a chatty agent can't blow up the payload
 - Disable with `capture_logs=False`
 
+### Extended Telemetry (on by default)
+
+Everything below ships as **additive** sections on the same payload — all previously
+existing fields are unchanged. Pass `extended_capture=False` for the legacy shape.
+Frames are matched by class name, so an older or newer Pipecat produces fewer
+fields rather than breaking.
+
+| Section | What's inside |
+|---------|---------------|
+| `call.turn_detection` | Turn-completion predictions (`TurnMetricsData`): avg/max end-to-end processing ms, prediction count, confidence, incomplete predictions |
+| `call.latency` (new keys) | Real per-service timings: `avg/p95_ttfb_ms`, `avg_ttfa_ms` + `avg_tts_leading_silence_ms`, `avg_processing_ms`, `avg_text_aggregation_ms`, `avg_turn_detection_ms`, `by_service` breakdown |
+| `call.usage` (new keys) | Full token breakdown: total, cache read/creation, reasoning, input/output audio tokens |
+| `call.speech_stats` | Talk seconds per side, turn counts, talk ratio, silence, longest gap, response delays |
+| `call.interruptions` | Interruption count, interruptions while the bot was speaking, user idle timeouts |
+| `call.errors` | `ErrorFrame` / `FatalErrorFrame` — message, `fatal`, processor, exception type |
+| `call.connection` | Transport lifecycle timeline (client connected, bot connected, output ready, disconnect) |
+| `call.sip` | `{attributes, dtmf}` — DTMF keypresses with timestamps and direction |
+| `call.vad` | Speech segments, total speech seconds, average segment length, VAD `start_secs`/`stop_secs` |
+| `call.pipeline` | Services seen, service metadata (`ttfs_p99_ms`, `is_realtime_service`), frame-type histogram, LLM reasoning counts |
+| `call.environment` | Observer / Pipecat / Python versions |
+
+```python
+observer = SuperbrynObserver(
+    agent_id=AGENT_ID,
+    api_key=os.getenv("SUPERBRYN_API_KEY"),
+    extended_capture=False,  # legacy payload shape only
+)
+```
+
+> **Note:** unlike the LiveKit SDK, a Pipecat observer has no access to
+> transport-level WebRTC statistics, so there is no jitter / RTT / packet-loss
+> data. `call.connection` captures the transport lifecycle events that *are*
+> observable. LLM reasoning is reported as a count and character total only —
+> the reasoning text itself is never transmitted.
+
 ## Agent Config Sync (opt-in)
 
 Push your agent's configuration to SuperBryn as a reviewable draft. Requires an **agent-scoped** API key; nothing syncs unless you call it explicitly:
@@ -200,11 +238,26 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
       "llm_input_tokens": 1250,
       "llm_output_tokens": 850,
       "stt_duration_seconds": 45.2,
-      "tts_characters": 1200
+      "tts_characters": 1200,
+      "llm_total_tokens": 2100,
+      "llm_cache_read_input_tokens": 800,
+      "llm_reasoning_tokens": 64,
+      "llm_input_audio_tokens": 0
     },
     "latency": {
       "avg_ms": 750.5,
-      "p95_ms": 1240.0
+      "p95_ms": 1240.0,
+      "avg_ttfb_ms": 335.0,
+      "p95_ttfb_ms": 480.0,
+      "avg_ttfa_ms": 260.0,
+      "avg_tts_leading_silence_ms": 70.0,
+      "avg_processing_ms": 1100.0,
+      "avg_text_aggregation_ms": 50.0,
+      "avg_turn_detection_ms": 310.0,
+      "by_service": {
+        "AnthropicLLM": { "avg_ttfb_ms": 480.0, "avg_processing_ms": 1100.0 },
+        "CartesiaTTS": { "avg_ttfb_ms": 190.0, "avg_ttfa_ms": 260.0 }
+      }
     },
     "tool_calls": [
       {
@@ -214,7 +267,51 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
         "result": { "items": [] },
         "timestamp_ms": 8200
       }
-    ]
+    ],
+    "turn_detection": {
+      "avg_e2e_processing_ms": 310.0,
+      "max_e2e_processing_ms": 540.0,
+      "prediction_count": 12,
+      "incomplete_predictions": 3,
+      "avg_probability": 0.91,
+      "events": [
+        { "timestamp_ms": 5200, "is_complete": true, "probability": 0.94, "e2e_processing_time_ms": 302.0 }
+      ]
+    },
+    "speech_stats": {
+      "user_talk_seconds": 41.2, "agent_talk_seconds": 88.6,
+      "user_turn_count": 12, "agent_turn_count": 13,
+      "avg_user_turn_seconds": 3.4, "avg_agent_turn_seconds": 6.8,
+      "agent_talk_ratio": 0.683, "silence_seconds": 20.2, "longest_silence_ms": 4100,
+      "avg_response_delay_ms": 910.4, "max_response_delay_ms": 2210.0
+    },
+    "interruptions": { "interruption_count": 2, "bot_turns_interrupted": 2, "user_idle_timeouts": 0 },
+    "errors": [
+      { "timestamp_ms": 84200, "message": "deepgram websocket closed: 1011",
+        "fatal": false, "processor": "DeepgramSTTService", "exception_type": "ConnectionClosed" }
+    ],
+    "connection": [
+      { "type": "ClientConnectedFrame", "timestamp_ms": 120 },
+      { "type": "OutputTransportReadyFrame", "timestamp_ms": 180 }
+    ],
+    "sip": { "attributes": {}, "dtmf": [ { "timestamp_ms": 32000, "digit": "1", "direction": "input" } ] },
+    "vad": {
+      "segment_count": 12, "total_speech_seconds": 41.2, "avg_segment_ms": 3433.0,
+      "params": { "start_secs": 0.2, "stop_secs": 0.8 },
+      "segments": [ { "start_ms": 5000, "end_ms": 7500, "duration_ms": 2500 } ]
+    },
+    "pipeline": {
+      "services_seen": ["AnthropicLLMService", "CartesiaTTSService", "DeepgramSTTService"],
+      "service_metadata": {
+        "deepgram": { "ttfs_p99_ms": 420.0 },
+        "anthropic": { "is_realtime_service": false }
+      },
+      "frame_counts": { "InterruptionFrame": 2, "TranscriptionFrame": 12 },
+      "llm_thought_count": 0, "llm_thought_chars": 0
+    },
+    "environment": {
+      "observer_version": "0.8.0", "pipecat_version": "1.7.0", "python_version": "3.12.12"
+    }
   }
 }
 ```

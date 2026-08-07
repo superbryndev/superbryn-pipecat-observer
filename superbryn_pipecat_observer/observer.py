@@ -24,10 +24,12 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
 import uuid
 import warnings
 from datetime import UTC, datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -86,6 +88,68 @@ _BOT_TEXT_FRAME_NAMES = (
 # multiple `<tool_use>` blocks parses as multiple calls instead of one
 # spanning the entire turn. DOTALL lets the inner JSON span newlines.
 _TOOL_USE_PATTERN = re.compile(r"<tool_use>\s*(\{.*?\})\s*</tool_use>", re.DOTALL)
+
+# Extended-capture payload bounds — keep the webhook body small on long calls
+_MAX_TURN_EVENTS = 200
+_MAX_EVENT_LIST = 100
+_MAX_ERROR_EVENTS = 50
+_MAX_DTMF_EVENTS = 100
+_ERROR_MSG_MAX_LEN = 500
+
+# Frames that mark a transport/connection lifecycle moment. Recorded with
+# their offset from call start so the consumer can see setup timing and drops.
+_CONNECTION_FRAME_NAMES = (
+    "ClientConnectedFrame",
+    "ClientDisconnectedFrame",
+    "BotConnectedFrame",
+    "OutputTransportReadyFrame",
+    "InputTransportStartAudioStreamingFrame",
+)
+
+
+def _as_seconds(value: Any) -> float:
+    """Coerce a Pipecat usage `value` to seconds.
+
+    Pipecat >= 1.6 wraps STT usage in an `STTUsage` object; older versions
+    emitted a bare float. Unknown shapes yield 0.0 rather than raising.
+    """
+    if value is None:
+        return 0.0
+    seconds = getattr(value, "audio_seconds", None)
+    if seconds is None:
+        seconds = value
+    try:
+        return float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_ms(seconds: Any) -> float:
+    try:
+        return float(seconds or 0.0) * 1000.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int(len(ordered) * pct) - 1))
+    return ordered[idx]
+
+
+def _json_safe(obj: Any) -> Any:
+    """Round-trip through JSON so one exotic value can't fail the whole POST."""
+    try:
+        return json.loads(json.dumps(obj, default=str))
+    except (TypeError, ValueError) as exc:
+        logger.warning("extended sections not JSON-serializable, omitting them: %s", exc)
+        return {}
 
 
 def _coerce_tool_payload(value: Any) -> Any:
@@ -185,6 +249,7 @@ class SuperbrynObserver(BaseObserver):
         enabled: bool = True,
         capture_logs: bool = True,
         max_log_records: int = 1000,
+        extended_capture: bool = True,
     ) -> None:
         # Pipecat 1.3's BaseObserver.__init__ wires internal state (e.g.
         # `_event_tasks`) that the pipeline relies on during cleanup. Without
@@ -324,6 +389,41 @@ class SuperbrynObserver(BaseObserver):
         self.latencies_ms: list[float] = []
         self.call_end_reason: str | None = None
         self._sent = False
+
+        # ── Extended capture ──────────────────────────────────────────────
+        # Additive payload sections built in `_build_extended_sections`.
+        # Everything here is passive frame observation; no new pipeline
+        # processors and no extra network calls.
+        self._extended_capture = extended_capture
+        self.extra_usage: dict[str, int] = {
+            "llm_total_tokens": 0,
+            "llm_cache_read_input_tokens": 0,
+            "llm_cache_creation_input_tokens": 0,
+            "llm_reasoning_tokens": 0,
+            "llm_input_audio_tokens": 0,
+            "llm_output_audio_tokens": 0,
+            "llm_cache_read_input_audio_tokens": 0,
+        }
+        # kind -> processor name -> samples (ms)
+        self.service_timings: dict[str, dict[str, list[float]]] = {}
+        self.turn_events: list[dict[str, Any]] = []
+        self.turn_e2e_ms: list[float] = []
+        self.turn_incomplete_predictions = 0
+        self.error_events: list[dict[str, Any]] = []
+        self.dtmf_events: list[dict[str, Any]] = []
+        self.connection_events: list[dict[str, Any]] = []
+        self.vad_segments: list[dict[str, Any]] = []
+        self.interruption_count = 0
+        self.bot_turns_interrupted = 0
+        self.user_idle_timeouts = 0
+        self.llm_thought_chars = 0
+        self.llm_thought_count = 0
+        self.service_metadata: dict[str, Any] = {}
+        self._processors_seen: set[str] = set()
+        self._frame_counts: dict[str, int] = {}
+        self._vad_speech_start_ms: int | None = None
+        self._vad_params: dict[str, float] = {}
+        self._bot_speaking = False
 
         # Deferred-upload / consent gate (Cekura parity). When set, the
         # SDK still captures audio + transcript locally but holds the S3
@@ -1200,6 +1300,9 @@ class SuperbrynObserver(BaseObserver):
                 # `on_pipeline_finished` won't double-send.
                 await self._finalize_session()
 
+            if self._extended_capture:
+                self._capture_extended_frame(frame, cls_name, source, source_module)
+
             # First time we see a service frame, infer provider from module path
             if source is not None:
                 self._sniff_provider(source, cls_name)
@@ -1474,38 +1577,223 @@ class SuperbrynObserver(BaseObserver):
     def _capture_metrics(self, frame: Any) -> None:
         """
         Pipecat emits MetricsFrame containing a list of typed metric records.
-        We pluck LLM token counts, STT audio seconds, and TTS character counts.
+        We pluck LLM token counts, STT audio seconds, and TTS character counts,
+        plus (when extended capture is on) per-service timing and turn metrics.
+
+        Each record is isolated: a record shape we can't parse must not abort
+        the loop and drop the remaining records in the same frame.
         """
         records = getattr(frame, "data", None) or []
         for rec in records:
-            cls_name = type(rec).__name__
-            if cls_name == "LLMUsageMetricsData":
-                tok = getattr(rec, "value", None)
-                if tok is not None:
-                    self.usage["llm_input_tokens"] += int(getattr(tok, "prompt_tokens", 0) or 0)
-                    self.usage["llm_output_tokens"] += int(
-                        getattr(tok, "completion_tokens", 0) or 0
+            try:
+                self._capture_metric_record(rec)
+            except Exception as exc:  # noqa: BLE001 — one bad record must not drop the rest
+                logger.debug("skipped metrics record %s: %s", type(rec).__name__, exc)
+
+    def _capture_metric_record(self, rec: Any) -> None:
+        cls_name = type(rec).__name__
+        if cls_name == "LLMUsageMetricsData":
+            tok = getattr(rec, "value", None)
+            if tok is not None:
+                self.usage["llm_input_tokens"] += int(getattr(tok, "prompt_tokens", 0) or 0)
+                self.usage["llm_output_tokens"] += int(getattr(tok, "completion_tokens", 0) or 0)
+                if self._extended_capture:
+                    self._capture_llm_token_details(tok)
+            if getattr(rec, "model", None):
+                self.usage["llm_model"] = rec.model
+                if not self.usage["llm_provider"]:
+                    self.usage["llm_provider"] = detect_provider_from_model(rec.model)
+        elif cls_name == "STTUsageMetricsData":
+            # Pipecat STT services report seconds of audio processed since the
+            # last report; sum them. Pipecat >= 1.6 wraps it in an `STTUsage`
+            # object (`.audio_seconds`) where older versions used a bare float.
+            self.usage["stt_duration_seconds"] += _as_seconds(getattr(rec, "value", 0))
+            if getattr(rec, "model", None):
+                self.usage["stt_model"] = rec.model
+                if not self.usage["stt_provider"]:
+                    self.usage["stt_provider"] = detect_provider_from_model(rec.model)
+        elif cls_name == "TTSUsageMetricsData":
+            self.usage["tts_characters"] += int(getattr(rec, "value", 0) or 0)
+            if getattr(rec, "model", None):
+                self.usage["tts_model"] = rec.model
+                if not self.usage["tts_provider"]:
+                    self.usage["tts_provider"] = detect_provider_from_model(rec.model)
+        elif self._extended_capture:
+            self._capture_extended_metric_record(rec, cls_name)
+
+    def _capture_llm_token_details(self, tok: Any) -> None:
+        """Accumulate the optional token breakdown (cache, reasoning, audio)."""
+        for key, attr in (
+            ("llm_cache_read_input_tokens", "cache_read_input_tokens"),
+            ("llm_cache_creation_input_tokens", "cache_creation_input_tokens"),
+            ("llm_reasoning_tokens", "reasoning_tokens"),
+            ("llm_input_audio_tokens", "input_audio_tokens"),
+            ("llm_output_audio_tokens", "output_audio_tokens"),
+            ("llm_cache_read_input_audio_tokens", "cache_read_input_audio_tokens"),
+        ):
+            self.extra_usage[key] += int(getattr(tok, attr, 0) or 0)
+        self.extra_usage["llm_total_tokens"] += int(getattr(tok, "total_tokens", 0) or 0)
+
+    def _capture_extended_metric_record(self, rec: Any, cls_name: str) -> None:
+        """Capture the timing/turn metrics Pipecat reports beyond raw usage."""
+        processor = getattr(rec, "processor", None) or "unknown"
+
+        if cls_name == "TTFBMetricsData":
+            self._record_service_timing("ttfb_ms", processor, _as_ms(getattr(rec, "value", 0)))
+        elif cls_name == "TTFAMetricsData":
+            # ttfa == ttfb + leading_silence; the SDK docs warn not to
+            # aggregate ttfa's inner ttfb with the standalone TTFB metric.
+            self._record_service_timing("ttfa_ms", processor, _as_ms(getattr(rec, "ttfa", 0)))
+            self._record_service_timing(
+                "tts_leading_silence_ms", processor, _as_ms(getattr(rec, "leading_silence", 0))
+            )
+        elif cls_name == "ProcessingMetricsData":
+            self._record_service_timing(
+                "processing_ms", processor, _as_ms(getattr(rec, "value", 0))
+            )
+        elif cls_name == "TextAggregationMetricsData":
+            self._record_service_timing(
+                "text_aggregation_ms", processor, _as_ms(getattr(rec, "value", 0))
+            )
+        elif cls_name in ("TurnMetricsData", "SmartTurnMetricsData"):
+            self._capture_turn_metric(rec)
+
+    def _record_service_timing(self, kind: str, processor: str, value_ms: float) -> None:
+        if value_ms <= 0:
+            return
+        self.service_timings.setdefault(kind, {}).setdefault(processor, []).append(value_ms)
+
+    def _capture_turn_metric(self, rec: Any) -> None:
+        """Record a turn-completion prediction (Pipecat's end-of-turn signal)."""
+        e2e_ms = float(getattr(rec, "e2e_processing_time_ms", 0.0) or 0.0)
+        if e2e_ms > 0:
+            self.turn_e2e_ms.append(e2e_ms)
+        if len(self.turn_events) < _MAX_TURN_EVENTS:
+            self.turn_events.append(
+                {
+                    "timestamp_ms": self._now_ms(),
+                    "is_complete": bool(getattr(rec, "is_complete", False)),
+                    "probability": round(float(getattr(rec, "probability", 0.0) or 0.0), 4),
+                    "e2e_processing_time_ms": round(e2e_ms, 1),
+                }
+            )
+        if not getattr(rec, "is_complete", True):
+            self.turn_incomplete_predictions += 1
+
+    def _capture_extended_frame(
+        self, frame: Any, cls_name: str, source: Any, source_module: str
+    ) -> None:
+        """Observe the frames the core capture path ignores.
+
+        Frames are matched by class name (never imported) so a Pipecat
+        release that adds or renames frames degrades to fewer fields
+        instead of breaking the observer.
+        """
+        try:
+            self._frame_counts[cls_name] = self._frame_counts.get(cls_name, 0) + 1
+            if source is not None and "pipecat.services." in source_module:
+                self._processors_seen.add(type(source).__name__)
+
+            if cls_name in ("ErrorFrame", "FatalErrorFrame"):
+                self._capture_error_frame(frame)
+            elif cls_name == "InterruptionFrame":
+                self.interruption_count += 1
+                if self._bot_speaking:
+                    self.bot_turns_interrupted += 1
+            elif cls_name == "BotStartedSpeakingFrame":
+                self._bot_speaking = True
+            elif cls_name == "BotStoppedSpeakingFrame":
+                self._bot_speaking = False
+            elif cls_name == "VADUserStartedSpeakingFrame":
+                self._vad_speech_start_ms = self._now_ms()
+                start_secs = getattr(frame, "start_secs", None)
+                if start_secs:
+                    self._vad_params["start_secs"] = float(start_secs)
+            elif cls_name == "VADUserStoppedSpeakingFrame":
+                self._close_vad_segment(frame)
+            elif cls_name in ("InputDTMFFrame", "OutputDTMFUrgentFrame", "OutputDTMFFrame"):
+                self._capture_dtmf(frame, cls_name)
+            elif cls_name in _CONNECTION_FRAME_NAMES:
+                if len(self.connection_events) < _MAX_EVENT_LIST:
+                    self.connection_events.append(
+                        {"type": cls_name, "timestamp_ms": self._now_ms()}
                     )
-                if getattr(rec, "model", None):
-                    self.usage["llm_model"] = rec.model
-                    if not self.usage["llm_provider"]:
-                        self.usage["llm_provider"] = detect_provider_from_model(rec.model)
-            elif cls_name == "STTUsageMetricsData":
-                # Pipecat STT services emit `value` as seconds of audio
-                # processed since the last report. Sum them so we
-                # correctly track total speech-to-text duration even
-                # across reconnects.
-                self.usage["stt_duration_seconds"] += float(getattr(rec, "value", 0) or 0)
-                if getattr(rec, "model", None):
-                    self.usage["stt_model"] = rec.model
-                    if not self.usage["stt_provider"]:
-                        self.usage["stt_provider"] = detect_provider_from_model(rec.model)
-            elif cls_name == "TTSUsageMetricsData":
-                self.usage["tts_characters"] += int(getattr(rec, "value", 0) or 0)
-                if getattr(rec, "model", None):
-                    self.usage["tts_model"] = rec.model
-                    if not self.usage["tts_provider"]:
-                        self.usage["tts_provider"] = detect_provider_from_model(rec.model)
+            elif cls_name in (
+                "STTMetadataFrame",
+                "LLMServiceMetadataFrame",
+                "ServiceMetadataFrame",
+            ):
+                self._capture_service_metadata(frame, cls_name)
+            elif cls_name == "LLMThoughtTextFrame":
+                self.llm_thought_chars += len(getattr(frame, "text", "") or "")
+            elif cls_name == "LLMThoughtStartFrame":
+                self.llm_thought_count += 1
+            elif cls_name == "UserIdleTimeoutUpdateFrame":
+                self.user_idle_timeouts += 1
+        except Exception as exc:  # noqa: BLE001 — observer must never raise
+            logger.debug("extended frame capture skipped %s: %s", cls_name, exc)
+
+    def _capture_error_frame(self, frame: Any) -> None:
+        processor = getattr(frame, "processor", None)
+        exception = getattr(frame, "exception", None)
+        entry = {
+            "timestamp_ms": self._now_ms(),
+            "message": str(getattr(frame, "error", "") or "")[:_ERROR_MSG_MAX_LEN],
+            "fatal": bool(getattr(frame, "fatal", False)),
+            "processor": type(processor).__name__ if processor is not None else None,
+            "exception_type": type(exception).__name__ if exception is not None else None,
+        }
+        if len(self.error_events) < _MAX_ERROR_EVENTS:
+            self.error_events.append(entry)
+        logger.warning(
+            "SUPERBRYN_PIPELINE_ERROR captured: fatal=%s processor=%s message=%s",
+            entry["fatal"],
+            entry["processor"],
+            entry["message"][:120],
+        )
+
+    def _close_vad_segment(self, frame: Any) -> None:
+        stop_secs = getattr(frame, "stop_secs", None)
+        if stop_secs:
+            self._vad_params["stop_secs"] = float(stop_secs)
+        if self._vad_speech_start_ms is None:
+            return
+        now_ms = self._now_ms()
+        if len(self.vad_segments) < _MAX_EVENT_LIST:
+            self.vad_segments.append(
+                {
+                    "start_ms": self._vad_speech_start_ms,
+                    "end_ms": now_ms,
+                    "duration_ms": max(0, now_ms - self._vad_speech_start_ms),
+                }
+            )
+        self._vad_speech_start_ms = None
+
+    def _capture_dtmf(self, frame: Any, cls_name: str) -> None:
+        button = getattr(frame, "button", None)
+        digit = getattr(button, "value", None) or (str(button) if button is not None else None)
+        if digit is None:
+            return
+        if len(self.dtmf_events) < _MAX_DTMF_EVENTS:
+            self.dtmf_events.append(
+                {
+                    "timestamp_ms": self._now_ms(),
+                    "digit": digit,
+                    "direction": "input" if cls_name == "InputDTMFFrame" else "output",
+                }
+            )
+
+    def _capture_service_metadata(self, frame: Any, cls_name: str) -> None:
+        name = getattr(frame, "service_name", None) or cls_name
+        entry: dict[str, Any] = {}
+        ttfs = getattr(frame, "ttfs_p99_latency", None)
+        if ttfs is not None:
+            entry["ttfs_p99_ms"] = round(_as_ms(ttfs), 1)
+        is_realtime = getattr(frame, "is_realtime_service", None)
+        if is_realtime is not None:
+            entry["is_realtime_service"] = bool(is_realtime)
+        if entry:
+            self.service_metadata[name] = entry
 
     def _capture_end_reason(self, cls_name: str) -> None:
         mapping = {
@@ -1794,10 +2082,169 @@ class SuperbrynObserver(BaseObserver):
         if self._captured_logs:
             call_body["logs"] = list(self._captured_logs)
 
+        if self._extended_capture:
+            call_body["usage"].update(self._build_usage_extras())
+            call_body["latency"].update(self._build_latency_extras())
+            call_body.update(self._build_extended_sections(turns_with_text, duration_seconds))
+
         return {
             "event": "call.completed",
             "sdk_version": _SDK_TAG,
             "call": call_body,
+        }
+
+    # ── Extended payload sections ─────────────────────────────────────────
+
+    def _build_usage_extras(self) -> dict[str, Any]:
+        return dict(self.extra_usage)
+
+    def _build_latency_extras(self) -> dict[str, Any]:
+        """Flatten per-service timings into avg/p95 aggregates + a per-service map."""
+        extras: dict[str, Any] = {}
+        by_service: dict[str, dict[str, float]] = {}
+
+        for kind, per_processor in self.service_timings.items():
+            all_samples = [v for samples in per_processor.values() for v in samples]
+            if not all_samples:
+                continue
+            extras[f"avg_{kind}"] = round(_mean(all_samples), 1)
+            p95 = _percentile(all_samples, 0.95)
+            if p95 is not None:
+                extras[f"p95_{kind}"] = round(p95, 1)
+            for processor, samples in per_processor.items():
+                by_service.setdefault(processor, {})[f"avg_{kind}"] = round(_mean(samples), 1)
+
+        if by_service:
+            extras["by_service"] = by_service
+        if self.turn_e2e_ms:
+            extras["avg_turn_detection_ms"] = round(_mean(self.turn_e2e_ms), 1)
+        return extras
+
+    def _build_extended_sections(
+        self, turns: list[dict[str, Any]], duration_seconds: float
+    ) -> dict[str, Any]:
+        """Assemble the additive sections; each builder is exception-isolated
+        so one failure degrades to null instead of dropping the webhook."""
+        builders = {
+            "turn_detection": self._build_turn_detection_section,
+            "speech_stats": lambda: self._build_speech_stats(turns, duration_seconds),
+            "interruptions": self._build_interruptions_section,
+            "errors": lambda: self.error_events,
+            "connection": lambda: self.connection_events,
+            "sip": lambda: {"attributes": {}, "dtmf": self.dtmf_events},
+            "vad": self._build_vad_section,
+            "pipeline": self._build_pipeline_section,
+            "environment": self._build_environment_section,
+        }
+        sections: dict[str, Any] = {}
+        for name, build in builders.items():
+            try:
+                sections[name] = build()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("failed to build extended section %s: %s", name, exc)
+                sections[name] = None
+        return _json_safe(sections)
+
+    def _build_turn_detection_section(self) -> dict[str, Any]:
+        return {
+            "avg_e2e_processing_ms": round(_mean(self.turn_e2e_ms), 1),
+            "max_e2e_processing_ms": round(max(self.turn_e2e_ms), 1) if self.turn_e2e_ms else 0.0,
+            "prediction_count": len(self.turn_events),
+            "incomplete_predictions": self.turn_incomplete_predictions,
+            "avg_probability": round(
+                _mean([e["probability"] for e in self.turn_events if e.get("probability")]), 4
+            ),
+            "events": self.turn_events,
+        }
+
+    def _build_speech_stats(
+        self, turns: list[dict[str, Any]], duration_seconds: float
+    ) -> dict[str, Any]:
+        user_seconds = agent_seconds = 0.0
+        user_turns = agent_turns = 0
+        response_delays: list[float] = []
+        timed: list[tuple[int, int]] = []
+
+        for turn in turns:
+            start_ms, end_ms = turn.get("start_time_ms"), turn.get("end_time_ms")
+            turn_seconds = (
+                (end_ms - start_ms) / 1000 if start_ms is not None and end_ms is not None else 0.0
+            )
+            if start_ms is not None and end_ms is not None:
+                timed.append((start_ms, end_ms))
+            if turn.get("speaker") == "user":
+                user_turns += 1
+                user_seconds += turn_seconds
+            else:
+                agent_turns += 1
+                agent_seconds += turn_seconds
+                if turn.get("latency_ms") is not None:
+                    response_delays.append(float(turn["latency_ms"]))
+
+        longest_gap_ms = 0
+        timed.sort()
+        for (_, prev_end), (next_start, _) in zip(timed, timed[1:], strict=False):
+            longest_gap_ms = max(longest_gap_ms, next_start - prev_end)
+
+        # Pipecat gives user turns a single STT timestamp (start == end), so
+        # user talk time comes from VAD segments when we observed them.
+        vad_user_seconds = sum(s["duration_ms"] for s in self.vad_segments) / 1000.0
+        if vad_user_seconds > 0:
+            user_seconds = vad_user_seconds
+
+        total_talk = user_seconds + agent_seconds
+        return {
+            "user_talk_seconds": round(user_seconds, 2),
+            "agent_talk_seconds": round(agent_seconds, 2),
+            "user_turn_count": user_turns,
+            "agent_turn_count": agent_turns,
+            "avg_user_turn_seconds": round(user_seconds / user_turns, 2) if user_turns else 0.0,
+            "avg_agent_turn_seconds": round(agent_seconds / agent_turns, 2) if agent_turns else 0.0,
+            "agent_talk_ratio": round(agent_seconds / total_talk, 3) if total_talk else None,
+            # Approximate: overlapping speech is not subtracted
+            "silence_seconds": round(max(0.0, duration_seconds - total_talk), 2),
+            "longest_silence_ms": longest_gap_ms,
+            "avg_response_delay_ms": round(_mean(response_delays), 1),
+            "max_response_delay_ms": round(max(response_delays), 1) if response_delays else 0.0,
+        }
+
+    def _build_interruptions_section(self) -> dict[str, Any]:
+        return {
+            "interruption_count": self.interruption_count,
+            "bot_turns_interrupted": self.bot_turns_interrupted,
+            "user_idle_timeouts": self.user_idle_timeouts,
+        }
+
+    def _build_vad_section(self) -> dict[str, Any]:
+        durations = [s["duration_ms"] for s in self.vad_segments]
+        return {
+            "segment_count": len(self.vad_segments),
+            "total_speech_seconds": round(sum(durations) / 1000.0, 2),
+            "avg_segment_ms": round(_mean(durations), 1),
+            "params": self._vad_params,
+            "segments": self.vad_segments,
+        }
+
+    def _build_pipeline_section(self) -> dict[str, Any]:
+        return {
+            "services_seen": sorted(self._processors_seen),
+            "service_metadata": self.service_metadata,
+            "frame_counts": dict(sorted(self._frame_counts.items())),
+            "llm_thought_count": self.llm_thought_count,
+            "llm_thought_chars": self.llm_thought_chars,
+        }
+
+    def _build_environment_section(self) -> dict[str, Any]:
+        def _pkg_version(name: str) -> str | None:
+            try:
+                return importlib_metadata.version(name)
+            except Exception:  # noqa: BLE001
+                return None
+
+        return {
+            "observer_version": __version__,
+            "pipecat_version": _pkg_version("pipecat-ai"),
+            "python_version": platform.python_version(),
         }
 
     async def _send_webhook(self, *, label: str = "") -> None:
