@@ -19,14 +19,21 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import (
     LLMTokenUsage,
     LLMUsageMetricsData,
-    STTUsage,
-    STTUsageMetricsData,
     TTFBMetricsData,
     TTSUsageMetricsData,
     TurnMetricsData,
 )
 
 from superbryn_pipecat_observer.observer import SuperbrynObserver
+
+try:  # STT usage metrics are newer than pipecat 1.4, the lowest version supported
+    from pipecat.metrics.metrics import STTUsage, STTUsageMetricsData
+except ImportError:
+    STTUsage = STTUsageMetricsData = None
+
+requires_stt_usage = pytest.mark.skipif(
+    STTUsageMetricsData is None, reason="this pipecat has no STT usage metrics"
+)
 
 
 @dataclass
@@ -46,6 +53,7 @@ async def push(observer, frame, source=None):
     await observer.on_push_frame(FakePushed(frame=frame, source=source))
 
 
+@requires_stt_usage
 @pytest.mark.asyncio
 async def test_stt_usage_object_is_read_and_does_not_drop_later_records():
     """Pipecat >= 1.6 wraps STT usage in an object; a float() on it used to
@@ -175,22 +183,23 @@ async def test_llm_token_detail_is_accumulated():
     usage = obs._build_payload()["call"]["usage"]
     assert usage["llm_cache_read_input_tokens"] == 8
     assert usage["llm_reasoning_tokens"] == 3
-    assert usage["llm_input_audio_tokens"] == 2
+    if "input_audio_tokens" in LLMTokenUsage.model_fields:  # newer than pipecat 1.4
+        assert usage["llm_input_audio_tokens"] == 2
     assert usage["llm_total_tokens"] == 15
 
 
 @pytest.mark.asyncio
 async def test_extended_capture_off_emits_legacy_payload_only():
     obs = make_observer(extended_capture=False)
+    stt_usage = (
+        [STTUsageMetricsData(processor="stt", value=STTUsage(audio_seconds=2.0))]
+        if STTUsageMetricsData is not None
+        else []
+    )
     await push(obs, InterruptionFrame())
     await push(
         obs,
-        MetricsFrame(
-            data=[
-                STTUsageMetricsData(processor="stt", value=STTUsage(audio_seconds=2.0)),
-                TTFBMetricsData(processor="llm", model="m", value=0.5),
-            ]
-        ),
+        MetricsFrame(data=[*stt_usage, TTFBMetricsData(processor="llm", model="m", value=0.5)]),
     )
 
     call = obs._build_payload()["call"]
@@ -209,8 +218,9 @@ async def test_extended_capture_off_emits_legacy_payload_only():
         assert section not in call
     assert "avg_ttfb_ms" not in call["latency"]
     assert "llm_reasoning_tokens" not in call["usage"]
-    # the STT usage fix is not gated behind extended capture
-    assert call["usage"]["stt_duration_seconds"] == 2.0
+    if stt_usage:
+        # the STT usage fix is not gated behind extended capture
+        assert call["usage"]["stt_duration_seconds"] == 2.0
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from .config_sync import (
     sync_manifest,
 )
 from .observer import SuperbrynObserver, __version__
+from .test_data import attach_test_data
 
 __all__ = [
     "BehaviorConfig",
@@ -29,6 +30,7 @@ __all__ = [
     "ToolConfig",
     "__version__",
     "async_sync_config",
+    "attach_test_data",
     "build_manifest_from_pipeline",
     "sync_config",
     "sync_manifest",

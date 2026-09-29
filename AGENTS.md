@@ -14,6 +14,7 @@ superbryn_pipecat_observer/
   config_sync.py       # opt-in agent config sync (manifest build + push)
   _provider_detect.py  # provider name detection from model/module strings
   config.py            # env-driven defaults (SUPERBRYN_API_KEY, ...)
+  test_data.py         # eval mode: attach_test_data, test-call data only; independent of the rest
 tests/                 # pytest suite — no network, fakes instead of live pipelines
 test_import.py         # root-level smoke script (also run in CI)
 ```
