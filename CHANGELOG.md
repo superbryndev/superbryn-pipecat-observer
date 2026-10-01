@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-01
+
 ### Fixed
 - **STT duration was silently zero on Pipecat >= 1.6, and took LLM/TTS usage down with it.** `STTUsageMetricsData.value` became an `STTUsage` object (`.audio_seconds`) where it used to be a bare float; the observer's `float(...)` coercion raised `TypeError` inside the `MetricsFrame` record loop, which aborted the loop — so any LLM or TTS record positioned after the STT record in the same frame was dropped too, and the whole failure was swallowed by `on_push_frame`'s catch-all. Usage now reads either shape, and each record is parsed in isolation so one unparseable record can't discard the rest of the batch. This fix applies regardless of `extended_capture`.
 
 ### Added
+- **Prompt sync.** `SuperbrynObserver(prompt=..., prompt_version=...)`: each production call carries `metadata.prompt_ref` (`sha256` of the template plus your label) and the template is pushed once per process per version to `POST /public-api/v1/prompts` (needs the `obs:write` scope; fails open). Without `prompt=`, the system prompt from the pipeline's LLM context is sent as `metadata.system_prompt`. Simulation runs never sync. `prompt_ref` / `prompt_hash` / `push_prompt` are exported for custom setups.
 - **Extended capture** (`extended_capture=True`, on by default): the observer now extracts the maximum telemetry Pipecat's frame stream exposes and emits it as **additive** sections on the call payload. All existing fields are unchanged; set `extended_capture=False` for the exact legacy payload. Section names deliberately mirror `livekit-evals` so both SDKs land the same shape server-side.
   - `call.turn_detection` — turn-completion predictions from `TurnMetricsData`: average/max end-to-end processing time (VAD speech-to-silence → turn complete), prediction count, incomplete predictions, average confidence, and a bounded event list (≤200). This is Pipecat's end-of-turn signal and the biggest previously-invisible slice of response latency.
   - `call.latency` (new keys) — real per-service timings from the metrics frames the observer previously ignored entirely: `avg/p95_ttfb_ms`, `avg_ttfa_ms` plus `avg_tts_leading_silence_ms` (how much of TTS latency is silence padding rather than service response), `avg_processing_ms`, `avg_text_aggregation_ms`, `avg_turn_detection_ms`, and a `by_service` breakdown keyed by processor name. The existing `avg_ms` / `p95_ms` (user-stop → bot-start response delay) are unchanged.
@@ -54,6 +57,7 @@ Versions before 0.7.1 predate this changelog. They cover the core observer
 (call payload delivery, transcripts, usage/latency metrics, audio recording
 via presigned S3 upload, log capture). See the git history for details.
 
-[Unreleased]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/superbryndev/superbryn-pipecat-observer/releases/tag/v0.7.1

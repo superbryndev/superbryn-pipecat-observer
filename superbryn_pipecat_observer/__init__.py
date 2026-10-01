@@ -18,6 +18,7 @@ from .config_sync import (
     sync_manifest,
 )
 from .observer import SuperbrynObserver, __version__
+from .prompt_sync import prompt_hash, prompt_ref, push_prompt
 
 __all__ = [
     "BehaviorConfig",
@@ -30,6 +31,9 @@ __all__ = [
     "__version__",
     "async_sync_config",
     "build_manifest_from_pipeline",
+    "prompt_hash",
+    "prompt_ref",
+    "push_prompt",
     "sync_config",
     "sync_manifest",
 ]
