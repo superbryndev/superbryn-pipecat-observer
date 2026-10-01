@@ -2366,7 +2366,11 @@ class SuperbrynObserver(BaseObserver):
 
             context = _find_llm_context(self._pipeline) if self._pipeline is not None else None
             if self.prompt:
-                tools = tools_from_context(_extract_tools_from_context(context)) if context is not None else []
+                tools = (
+                    tools_from_context(_extract_tools_from_context(context))
+                    if context is not None
+                    else []
+                )
                 await push_prompt(
                     api_key=self.api_key,
                     api_base_url=self.api_base_url,
