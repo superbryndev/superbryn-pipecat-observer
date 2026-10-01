@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-01
+
 ### Fixed
 - **STT duration was silently zero on Pipecat >= 1.6, and took LLM/TTS usage down with it.** `STTUsageMetricsData.value` became an `STTUsage` object (`.audio_seconds`) where it used to be a bare float; the observer's `float(...)` coercion raised `TypeError` inside the `MetricsFrame` record loop, which aborted the loop — so any LLM or TTS record positioned after the STT record in the same frame was dropped too, and the whole failure was swallowed by `on_push_frame`'s catch-all. Usage now reads either shape, and each record is parsed in isolation so one unparseable record can't discard the rest of the batch. This fix applies regardless of `extended_capture`.
 
@@ -55,6 +57,7 @@ Versions before 0.7.1 predate this changelog. They cover the core observer
 (call payload delivery, transcripts, usage/latency metrics, audio recording
 via presigned S3 upload, log capture). See the git history for details.
 
-[Unreleased]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/superbryndev/superbryn-pipecat-observer/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/superbryndev/superbryn-pipecat-observer/releases/tag/v0.7.1
