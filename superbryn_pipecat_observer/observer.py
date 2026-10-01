@@ -36,6 +36,7 @@ from typing import Any, ClassVar
 from ._provider_detect import detect_provider_from_model
 from .audio_recorder import SuperbrynAudioRecorder
 from .config import AGENT_CONFIG, WEBHOOK_CONFIG
+from .prompt_sync import clip_system_prompt, prompt_ref, push_prompt, tools_from_context
 from .s3_uploader import fetch_recording_upload_url, upload_wav_via_presigned
 
 try:
@@ -250,6 +251,10 @@ class SuperbrynObserver(BaseObserver):
         capture_logs: bool = True,
         max_log_records: int = 1000,
         extended_capture: bool = True,
+        prompt: str | None = None,
+        prompt_version: str | None = None,
+        first_message: str | None = None,
+        sync_prompt: bool = True,
     ) -> None:
         # Pipecat 1.3's BaseObserver.__init__ wires internal state (e.g.
         # `_event_tasks`) that the pipeline relies on during cleanup. Without
@@ -313,6 +318,18 @@ class SuperbrynObserver(BaseObserver):
         if custom_metadata:
             merged_metadata.update(custom_metadata)
         self.extra_metadata = merged_metadata
+
+        # Prompt sync. `prompt` is the template your agent runs (placeholders
+        # unfilled): each call names it by hash and its text is pushed to
+        # SuperBryn once per version, so a prompt change shows up at once.
+        # Without it, the system prompt found in the pipeline's LLM context is
+        # sent with the call as rendered text (matched after a few calls).
+        self.prompt = prompt
+        self.prompt_version = prompt_version
+        self.first_message = first_message
+        self.sync_prompt = sync_prompt
+        self._pipeline: Any | None = None
+        self._prompt_metadata: dict[str, Any] = {}
 
         # Session ID precedence: explicit constructor arg → uuid4(). The
         # high-level `observe_pipeline` / `track_pipeline` entrypoints
@@ -560,6 +577,7 @@ class SuperbrynObserver(BaseObserver):
             return pipeline
 
         self._apply_runtime_overrides(runner_args, session_id, custom_metadata)
+        self._pipeline = pipeline
         self._defer_upload = bool(defer_upload)
         if self._defer_upload:
             self._deferred_release = asyncio.Event()
@@ -2027,6 +2045,7 @@ class SuperbrynObserver(BaseObserver):
             "tts_voice_id": self.usage["tts_voice_id"],
             "pipeline_version": _SDK_TAG,
             "mode": "observe",
+            **self._prompt_metadata,
             **self.extra_metadata,
         }
 
@@ -2274,6 +2293,7 @@ class SuperbrynObserver(BaseObserver):
             logger.warning("SUPERBRYN_PIPECAT_NO_URL: webhook URL not configured")
             return
 
+        await self._prepare_prompt_sync()
         payload = self._build_payload()
 
         # ── Step 1: direct-to-S3 audio upload ─────────────────────────
@@ -2327,6 +2347,41 @@ class SuperbrynObserver(BaseObserver):
                     await self._handle_webhook_response(resp)
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.error("SUPERBRYN_PIPECAT_ERROR: %s", exc, exc_info=True)
+
+    async def _prepare_prompt_sync(self) -> None:
+        """Names the prompt this call ran on (``prompt_ref``) and makes sure SuperBryn has its text.
+
+        Production (``monitor_*``) calls only: a simulation run tests a draft
+        prompt and must not read as a change to the live one.
+        """
+        self._prompt_metadata = {}
+        if not self.sync_prompt or self.extra_metadata.get("mode") == "track":
+            return
+        try:
+            from .config_sync import (
+                _extract_prompt_from_context,
+                _extract_tools_from_context,
+                _find_llm_context,
+            )
+
+            context = _find_llm_context(self._pipeline) if self._pipeline is not None else None
+            if self.prompt:
+                tools = tools_from_context(_extract_tools_from_context(context)) if context is not None else []
+                await push_prompt(
+                    api_key=self.api_key,
+                    api_base_url=self.api_base_url,
+                    template=self.prompt,
+                    version=self.prompt_version,
+                    first_message=self.first_message,
+                    tools=tools,
+                )
+                self._prompt_metadata = {"prompt_ref": prompt_ref(self.prompt, self.prompt_version)}
+                return
+            system_prompt = _extract_prompt_from_context(context) if context is not None else None
+            if system_prompt:
+                self._prompt_metadata = {"system_prompt": clip_system_prompt(system_prompt)}
+        except Exception as exc:  # noqa: BLE001 — prompt sync never breaks call delivery
+            logger.warning("SUPERBRYN_PROMPT_SYNC_FAILED: %s", exc)
 
     async def _upload_audio_to_s3(
         self,
