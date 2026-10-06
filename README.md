@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.8.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.9.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -149,6 +149,28 @@ observer = SuperbrynObserver(
 > observable. LLM reasoning is reported as a count and character total only —
 > the reasoning text itself is never transmitted.
 
+## Prompt Sync
+
+Keeps SuperBryn in step with the prompt your agent runs. Pass the prompt template (placeholders unfilled) to the observer:
+
+```python
+observer = SuperbrynObserver(
+    agent_name="my-pipecat-bot",
+    prompt=SYSTEM_PROMPT,     # the template your agent runs
+    prompt_version="v13",     # optional: your label for this version
+)
+```
+
+- Every call carries `metadata.prompt_ref = {"hash": "sha256:...", "version": "v13"}`.
+- The template's text is pushed to SuperBryn once per process per version (`POST /public-api/v1/prompts`), with the tools found in the pipeline's LLM context.
+- When you deploy a changed prompt, the agent's settings in SuperBryn show the change and offer to make it a new version. A prompt saved but never deployed never shows up, because no call names it.
+- Prompt sync never holds a call back: if the push fails, the call is still sent, and it is matched once the prompt text arrives.
+- The API key needs the `obs:write` scope. Keys generated in Monitor > Configure have it; with an older key the observer logs `SUPERBRYN_PROMPT_SYNC_FORBIDDEN` once and keeps sending calls.
+- Without `prompt=`, the system prompt found in the pipeline's LLM context is sent as `metadata.system_prompt`. SuperBryn reads it as rendered text (it can differ per call), so a change shows up after a few calls instead of one.
+- Simulation runs (`simulate_*`) never sync: they test drafts, not the live prompt. Set `sync_prompt=False` to turn it off.
+
+Any stack can compute the hash itself: `sha256` over the template's UTF-8 bytes, written `sha256:<hex>` (`superbryn_pipecat_observer.prompt_ref(template, version)`).
+
 ## Agent Config Sync (opt-in)
 
 Push your agent's configuration to SuperBryn as a reviewable draft. Requires an **agent-scoped** API key; nothing syncs unless you call it explicitly:
@@ -193,7 +215,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.8.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.9.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -231,7 +253,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.8.0",
+      "pipeline_version": "@superbryn/pipecat-observer@0.9.0",
       "mode": "observe"
     },
     "usage": {
