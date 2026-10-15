@@ -1801,7 +1801,8 @@ async def test_push_time_is_corrected_for_observer_lag(clock, http):
             return 5_500_000_000  # the pipeline clock reads 5.5 s when the observer runs
 
     out = FakeOutput(TransportParams())
-    out._clock = PipelineClock()
+    # Stubbed at the public method: Pipecat 1.4 kept the clock in `_clock`, newer releases in `processor_setup`.
+    out.get_clock = PipelineClock
     call = await Call(clock, superbryn_call_id="sb").start()
     clock.t = T0 + 6.0  # the observer runs late
     pushes = [
