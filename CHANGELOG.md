@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-09-28
+## [0.10.0] - Unreleased
 
 ### Fixed
-- **STT duration was silently zero on Pipecat >= 1.6, and took LLM/TTS usage down with it.** `STTUsageMetricsData.value` became an `STTUsage` object (`.audio_seconds`) where it used to be a bare float; the observer's `float(...)` coercion raised `TypeError` inside the `MetricsFrame` record loop, which aborted the loop — so any LLM or TTS record positioned after the STT record in the same frame was dropped too, and the whole failure was swallowed by `on_push_frame`'s catch-all. Usage now reads either shape, and each record is parsed in isolation so one unparseable record can't discard the rest of the batch. This fix applies regardless of `extended_capture`.
 - **Eval mode, found in review before release** (`test_data.py`):
   - A slow or unreachable SuperBryn API no longer holds the pipeline's teardown (up to ~51 s for a test call, ~18 s for an ordinary call). The end-of-call step (waiting for `call.started`, the end frame and `call.ended` with its retries) has one 12 s budget, and a call without a test ID that ends while the SuperBryn-number lookup is still running cancels it and sends nothing.
   - Realtime (speech-to-speech) pipelines sent no caller turns: their services push the caller's transcript upstream, which was dropped. It is now captured once however many processors it passes, and without VAD frames the service's own `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` time the caller's turns, so a transcript that completes after the reply started stays before it.
@@ -26,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A call is a test call when it carries a SuperBryn test ID (the `superbryn_call_id=` argument, `superbryn_call_id` in the start body, a Daily dial-in SIP header ending in `x-superbryn-call-id`, or a telephony custom parameter), or when its caller or dialled number is one of SuperBryn's numbers (`GET /public-api/v1/test-calls/caller-numbers`, cached for an hour).
   - Needs an org API key with `test_data:write` (`SUPERBRYN_TEST_API_KEY`, else `SUPERBRYN_API_KEY`) and the SuperBryn agent ID (`agent_id=` or `SUPERBRYN_AGENT_ID`); without either, nothing is sent and one line is logged. Up to 3 attempts per event; `call.ended` is skipped when the server answers `is_test: false`.
   - Independent of `SuperbrynObserver`: its own module (`test_data.py`), frame capture and HTTP client. Built against the Pipecat 1.4 frame, metric and service classes.
+
+## [0.9.0] - 2026-10-01
+
+### Fixed
+- **STT duration was silently zero on Pipecat >= 1.6, and took LLM/TTS usage down with it.** `STTUsageMetricsData.value` became an `STTUsage` object (`.audio_seconds`) where it used to be a bare float; the observer's `float(...)` coercion raised `TypeError` inside the `MetricsFrame` record loop, which aborted the loop — so any LLM or TTS record positioned after the STT record in the same frame was dropped too, and the whole failure was swallowed by `on_push_frame`'s catch-all. Usage now reads either shape, and each record is parsed in isolation so one unparseable record can't discard the rest of the batch. This fix applies regardless of `extended_capture`.
+
+### Added
+- **Prompt sync.** `SuperbrynObserver(prompt=..., prompt_version=...)`: each production call carries `metadata.prompt_ref` (`sha256` of the template plus your label) and the template is pushed once per process per version to `POST /public-api/v1/prompts` (needs the `obs:write` scope; fails open). Without `prompt=`, the system prompt from the pipeline's LLM context is sent as `metadata.system_prompt`. Simulation runs never sync. `prompt_ref` / `prompt_hash` / `push_prompt` are exported for custom setups.
 - **Extended capture** (`extended_capture=True`, on by default): the observer now extracts the maximum telemetry Pipecat's frame stream exposes and emits it as **additive** sections on the call payload. All existing fields are unchanged; set `extended_capture=False` for the exact legacy payload. Section names deliberately mirror `livekit-evals` so both SDKs land the same shape server-side.
   - `call.turn_detection` — turn-completion predictions from `TurnMetricsData`: average/max end-to-end processing time (VAD speech-to-silence → turn complete), prediction count, incomplete predictions, average confidence, and a bounded event list (≤200). This is Pipecat's end-of-turn signal and the biggest previously-invisible slice of response latency.
   - `call.latency` (new keys) — real per-service timings from the metrics frames the observer previously ignored entirely: `avg/p95_ttfb_ms`, `avg_ttfa_ms` plus `avg_tts_leading_silence_ms` (how much of TTS latency is silence padding rather than service response), `avg_processing_ms`, `avg_text_aggregation_ms`, `avg_turn_detection_ms`, and a `by_service` breakdown keyed by processor name. The existing `avg_ms` / `p95_ms` (user-stop → bot-start response delay) are unchanged.
