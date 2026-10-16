@@ -19,6 +19,7 @@ from .config_sync import (
 )
 from .observer import SuperbrynObserver, __version__
 from .prompt_sync import prompt_hash, prompt_ref, push_prompt
+from .test_data import attach_test_data
 
 __all__ = [
     "BehaviorConfig",
@@ -30,6 +31,7 @@ __all__ = [
     "ToolConfig",
     "__version__",
     "async_sync_config",
+    "attach_test_data",
     "build_manifest_from_pipeline",
     "prompt_hash",
     "prompt_ref",

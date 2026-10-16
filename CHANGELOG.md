@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - Unreleased
+
+### Fixed
+- **Eval mode, found in review before release** (`test_data.py`):
+  - A slow or unreachable SuperBryn API no longer holds the pipeline's teardown (up to ~51 s for a test call, ~18 s for an ordinary call). The end-of-call step (waiting for `call.started`, the end frame and `call.ended` with its retries) has one 12 s budget, and a call without a test ID that ends while the SuperBryn-number lookup is still running cancels it and sends nothing.
+  - Realtime (speech-to-speech) pipelines sent no caller turns: their services push the caller's transcript upstream, which was dropped. It is now captured once however many processors it passes, and without VAD frames the service's own `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` time the caller's turns, so a transcript that completes after the reply started stays before it.
+  - `endpointingLatency` left out the stop strategy's own wait (speech timeout, smart-turn timeout) and read 200 ms for turns that took 0.8-3.2 s to end. It now runs from the user's silence to the turn's release (`UserStoppedSpeakingFrame`), falling back to the old estimate when there is none; `turn_detection.min_end_of_turn_ms` is the shortest such wait.
+  - An agent turn cut off before any of it was played reported the LLM's whole answer. LLM text now stands in only when the pipeline never reports played TTS text, and never for an interrupted turn.
+  - With a user mute strategy, what the user said while muted (never heard by the agent) was appended to the previous user turn; it is now left out.
+  - Attaching after the task started timed the whole call from its end (every turn at 0 ms). The call is now timed from the first frame seen, `call.started` is sent then, and a warning is logged.
+  - A Twilio bot that parses the handshake itself (`parse_telephony_websocket` instead of `create_transport`) was never recognised. The handshake Pipecat caches on the websocket is now read, and `call_data=` passes one explicitly; a call with neither a test ID nor phone numbers logs one `INFO` line.
+  - A test ID or number that still holds an unfilled template placeholder (such as `{From}` pasted into TwiML) is ignored, with a warning, instead of being sent as the test ID.
+
+### Added
+- **Eval mode (testing data).** New `attach_test_data(task, runner_args)` reports SuperBryn test calls to `POST /public-api/v1/test-calls/agent-data`: `call.started` when the pipeline starts, and `call.ended` when it finishes, with the transcript, tool calls and diagnostics (per-reply latency, STT/LLM/TTS configuration, turn detection, tools, token and character usage, every LLM response with its start, its tokens and what became of it: spoken, cut off, not spoken, stopped or only a tool call, every error frame by pipeline step, interruption settings from the user turn start strategies, the STT's confidence for Deepgram, Google, Gladia, AWS Transcribe and Soniox, a tool call's `is_error` when its handler raised or the tool isn't registered, and STT audio time: reported by newer Pipecat, measured on 1.4 from the audio a streaming STT receives). Every other call sends nothing.
+  - A call is a test call when it carries a SuperBryn test ID (the `superbryn_call_id=` argument, `superbryn_call_id` in the start body, a Daily dial-in SIP header ending in `x-superbryn-call-id`, or a telephony custom parameter), or when its caller or dialled number is one of SuperBryn's numbers (`GET /public-api/v1/test-calls/caller-numbers`, cached for an hour).
+  - Needs an org API key with `test_data:write` (`SUPERBRYN_TEST_API_KEY`, else `SUPERBRYN_API_KEY`) and the SuperBryn agent ID (`agent_id=` or `SUPERBRYN_AGENT_ID`); without either, nothing is sent and one line is logged. Up to 3 attempts per event; `call.ended` is skipped when the server answers `is_test: false`.
+  - Independent of `SuperbrynObserver`: its own module (`test_data.py`), frame capture and HTTP client. Built against the Pipecat 1.4 frame, metric and service classes.
+
 ## [0.9.0] - 2026-10-01
 
 ### Fixed

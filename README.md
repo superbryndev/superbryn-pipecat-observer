@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.9.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.10.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -203,6 +203,57 @@ Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurr
 
 Docs: https://docs.superbryn.com/advanced/agent-sync
 
+## Testing data (eval mode)
+
+For SuperBryn test calls only, `attach_test_data` sends your agent's own record of the call to SuperBryn: `call.started` when the pipeline starts, and `call.ended` when it finishes, with the transcript, tool calls and diagnostics. Every other call sends nothing, and audio is never sent. It is independent of `SuperbrynObserver`; use either or both.
+
+```python
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from superbryn_pipecat_observer import attach_test_data
+
+
+async def bot(runner_args):
+    ...
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+    attach_test_data(task, runner_args)  # before the task runs
+    await runner.run(task)
+```
+
+| Variable | Meaning |
+|---|---|
+| `SUPERBRYN_TEST_API_KEY` | Org API key with the `test_data:write` scope; falls back to `SUPERBRYN_API_KEY`. Without a key nothing is sent. |
+| `SUPERBRYN_AGENT_ID` | Your SuperBryn agent ID (a UUID). Without it nothing is sent. |
+| `SUPERBRYN_BASE_URL` | Defaults to `https://api.superbryn.com`. |
+
+Keyword arguments override these (`api_key=`, `agent_id=`, `base_url=`), and `superbryn_call_id=`, `from_number=`, `to_number=`, `call_id=` and `call_data=` (a parsed telephony handshake) pass values your bot already knows.
+
+A call is a SuperBryn test call when, in this order:
+
+1. `superbryn_call_id=` is passed;
+2. `runner_args.body` has `superbryn_call_id` (webhook, custom cURL and Pipecat Cloud starts);
+3. a Daily dial-in SIP header ends in `x-superbryn-call-id`;
+4. a telephony WebSocket carries a `superbryn_call_id` custom parameter (Twilio stream parameters, Exotel custom parameters), read from `call_data=`, else `runner_args.call_data`, else the handshake your bot parsed itself with `parse_telephony_websocket`;
+5. otherwise, the caller or dialled number is one of SuperBryn's test numbers.
+
+A value that still holds a template placeholder such as `{From}` is ignored, with a warning. A call with neither a test ID nor phone numbers logs one `INFO` line and sends nothing.
+
+`call.ended` carries:
+
+- `transcript`: user turns timed by VAD (or, in realtime pipelines without VAD, by the service's own turn frames) with their final transcripts; what the user says while a user mute strategy is active is left out, as the agent never hears it. Agent turns run from bot started to bot stopped speaking, with the text the output transport played and whether the user interrupted; the LLM text stands in only when the pipeline never reports played text, and never for an interrupted turn.
+- `tool_calls`: name, arguments, result, start and end, and the agent turn each belongs to.
+- `diagnostics.turn_latencies`: per reply, `turnLatency` (user stopped speaking to bot started), `endpointingLatency` (user stopped speaking to the turn's release, including the stop strategy's wait), `transcriberLatency`, `modelLatency` and `voiceLatency`.
+- `diagnostics.configuration`: STT, LLM and TTS provider and model, the TTS voice, turn detection, and the LLM's tools.
+- `diagnostics.usage`: LLM input, cached input and output tokens, and TTS characters.
+- `diagnostics.errors`: every error frame by pipeline step (`stt`, `llm`, `tts`, or `telephony` for a transport), whether that step worked again later, and a fatal one never recovered. A tool handler that raised is `is_error` on its tool call instead.
+- `diagnostics.configuration.interruptions`: from the user turn start strategies: enabled, `min_words` (the min-words strategy) and `min_duration_ms` (VAD's start time when the VAD strategy is used).
+- Caller turns carry the STT's `confidence` when the provider's result has one (Deepgram, Google, Gladia, AWS Transcribe, Soniox), and `usage.stt_audio_ms` is the STT usage Pipecat reports, or on Pipecat 1.4 (which reports none) the audio delivered to a streaming STT while it isn't muted; a segmented STT gets none.
+- `diagnostics.llm_requests`: every LLM response, with when it started, its tokens and what became of it: `spoken`, `cut_off` (the caller cut in), `not_spoken` (generated, never played), `stopped` (nothing came back) or `tool_call` (only a tool call).
+
+Latency and usage need `enable_metrics=True` and `enable_usage_metrics=True` in `PipelineParams`; a warning is logged when either is off. Attaching after the task started logs a warning and times the call from the first frame seen. When the pipeline finishes, sending `call.ended` gets at most 12 seconds; a call without a test ID that ends before the SuperBryn-number check finishes sends nothing and adds no wait. Log lines start with `SUPERBRYN_TEST_DATA`; a `401` or `403` means the key lacks `test_data:write`.
+
 ## How It Works
 
 1. **Pipeline observation.** The observer is registered via `PipelineTask(observers=[...])` — it runs **alongside** your pipeline, not inside it.
@@ -215,7 +266,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.9.0",
+  "sdk_version": "@superbryn/pipecat-observer@0.10.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -253,7 +304,7 @@ Docs: https://docs.superbryn.com/advanced/agent-sync
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.9.0",
+      "pipeline_version": "@superbryn/pipecat-observer@0.10.0",
       "mode": "observe"
     },
     "usage": {
