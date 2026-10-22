@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.10.1] - 2026-10-22
 
 ### Fixed
+- **Eval mode** (`test_data.py`): a call with no failures sends `errors: []` instead of leaving `errors` out, which SuperBryn read as not sent. Its error metrics were skipped on every clean call instead of reading 0. The observer sees every `ErrorFrame`, so an empty list means none happened. A tool handler that raised is still that tool call's `is_error`, not a pipeline error.
 - **Eval mode** (`test_data.py`): a caller line nothing timed now carries no `start_ms`. That happens with a speech-to-speech service that reports no caller turns and no local VAD (Nova Sonic, Gemini Live), or a pipeline with neither VAD nor turn frames. It used to carry when its transcript arrived, after the caller finished. Nova Sonic sends that transcript only as its reply starts. The line still keeps its place in the transcript, and tool calls still link to the right agent turn.
 
 ### Changed

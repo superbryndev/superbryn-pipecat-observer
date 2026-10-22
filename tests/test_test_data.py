@@ -583,7 +583,7 @@ async def test_event_bodies(clock, http):
     assert (body["event_id"], body["event"]) == ("pc:c-1:ended", "call.ended")
     assert (body["ended_at"], body["ended_reason"]) == ("2027-01-15T08:00:12.500Z", "ended")
     assert body["transcript"] == [] and body["tool_calls"] == []
-    assert "diagnostics" not in body
+    assert body["diagnostics"] == {"errors": []}  # nothing else to report, but no failure either
     request = http.requests[-1]
     assert request["url"] == "https://staging.example.com/public-api/v1/test-calls/agent-data"
     assert request["headers"] == {"X-API-Key": "sk_test", "Content-Type": "application/json"}
@@ -1372,7 +1372,9 @@ async def test_a_tool_that_raised_or_does_not_exist_is_an_error(clock, http):
         ("c2", True),
         ("c3", False),
     ]
-    assert "errors" not in (body.get("diagnostics") or {})
+    assert (
+        body["diagnostics"]["errors"] == []
+    )  # a tool that failed is the tool call's error, not the pipeline's
 
 
 def audio(seconds: float, rate: int = 16000) -> InputAudioRawFrame:

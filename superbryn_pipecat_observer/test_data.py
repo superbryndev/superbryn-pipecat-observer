@@ -1016,7 +1016,9 @@ class _Capture:
             "llm_requests": _section("llm_requests", self.llm_requests),
             "errors": _section("errors", self.errors),
         }
-        return {k: v for k, v in diagnostics.items() if v} or None
+        # an empty errors list is sent: the observer sees every ErrorFrame, so none means the call had no failure
+        # (SuperBryn reads a missing list as not sent); a section that failed to build is None and stays out
+        return {k: v for k, v in diagnostics.items() if v or (k == "errors" and v == [])} or None
 
     def _service_config(self, role: str) -> dict[str, str] | None:
         service = self._services.get(role)
