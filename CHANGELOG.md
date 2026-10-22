@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-22
+
+### Fixed
+- **Eval mode** (`test_data.py`): a caller line nothing timed now carries no `start_ms`. That happens with a speech-to-speech service that reports no caller turns and no local VAD (Nova Sonic, Gemini Live), or a pipeline with neither VAD nor turn frames. It used to carry when its transcript arrived, after the caller finished. Nova Sonic sends that transcript only as its reply starts. The line still keeps its place in the transcript, and tool calls still link to the right agent turn.
+
+### Changed
+- **Eval mode:** Nova Sonic and Gemini Live send no `llm_requests`. Both mark a response started only when its first output arrives (Nova with its reply's first text, Gemini Live with its first model turn), so no request's start or outcome can be told. OpenAI Realtime keeps its requests: it marks a response when the server creates it, before any audio.
+
+### Added
+- **Eval mode:** `configuration.turn_detection.preemptive_generation`.
+  - `true` when a user turn stop strategy leaves completion to an external judge (`ExternalUserTurnCompletionStopStrategy`, such as `LLMTurnCompletionUserTurnStopStrategy`). The LLM then starts on a detector's trigger before the turn is final, and drops the answer if the turn wasn't complete.
+  - `false` with the other strategies, which start it as the turn ends.
+  - Not sent for speech-to-speech pipelines.
+  - SuperBryn uses it to name why replies were dropped: early drafts, or the end-of-turn wait.
+- **Eval mode:** `configuration.turn_detection.type` is `realtime_llm` for a speech-to-speech pipeline with no VAD or turn analyzer, whose service takes the turns itself.
+
 ## [0.10.0] - Unreleased
 
 ### Fixed
