@@ -101,6 +101,10 @@ try:
     from pipecat.turns.user_start import MinWordsUserTurnStartStrategy, VADUserTurnStartStrategy
 except ImportError:  # pragma: no cover - depends on the Pipecat version
     MinWordsUserTurnStartStrategy = VADUserTurnStartStrategy = None  # type: ignore[assignment,misc]
+try:
+    from pipecat.turns.user_stop import ExternalUserTurnCompletionStopStrategy
+except ImportError:  # pragma: no cover - depends on the Pipecat version
+    ExternalUserTurnCompletionStopStrategy = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("superbryn_pipecat_observer.test_data")
 
@@ -134,6 +138,13 @@ _TOOL_ERROR = re.compile(r"^Error executing function call \[(.+?)\]")
 _EXCLUSIVE_INPUT_LLMS = {
     ("pipecat.services.anthropic.llm", "AnthropicLLMService"),
     ("pipecat.services.aws.llm", "AWSBedrockLLMService"),
+}
+
+# Speech-to-speech services that mark a response started only when its first output arrives (Nova Sonic with its
+# reply's first text, Gemini Live with its first model turn), so no request's start can be told: none are sent.
+_OUTPUT_STAMPED_LLMS = {
+    ("pipecat.services.aws.nova_sonic.llm", "AWSNovaSonicLLMService"),
+    ("pipecat.services.google.gemini_live.llm", "GeminiLiveLLMService"),
 }
 
 # base URL -> (monotonic expiry, caller numbers or None after a failed fetch)
@@ -432,6 +443,10 @@ class _Capture:
         self._errors: list[dict[str, Any]] = []
         self._worked: dict[str, float] = {}  # step -> the last time it produced output
         self._interruptions: dict[str, Any] | None = None
+        # True when a stop strategy lets the LLM start before the turn is final (LLM-judged turn completion)
+        self._preemptive: bool | None = None
+        # each sent line's place on the observer's clock, ms (an untimed caller line's too), set by transcript()
+        self._line_at: dict[str, int] = {}
         self._vad_start_secs: float | None = None
         # audio delivered to a streaming STT, for Pipecat versions that report no STT usage
         self._stt_audio_s = 0.0
@@ -828,10 +843,16 @@ class _Capture:
 
     def _turn_strategies(self, source: Any) -> None:
         """How the caller interrupts, from the user turn start strategies the user aggregator (or turn processor)
-        holds: on when a strategy interrupts the bot, the min-words strategy's words, VAD's start time."""
+        holds: on when a strategy interrupts the bot, the min-words strategy's words, VAD's start time. And whether
+        the LLM starts before the turn is final: a stop strategy that leaves completion to an external judge (the
+        LLM's own markers) runs inference on each deferred detector's trigger, and an incomplete turn drops it."""
+        controller = getattr(source, "_user_turn_controller", None)
+        stop = getattr(getattr(controller, "_user_turn_strategies", None), "stop", None)
+        if self._preemptive is None and isinstance(stop, list) and stop:
+            judged = ExternalUserTurnCompletionStopStrategy
+            self._preemptive = judged is not None and any(isinstance(s, judged) for s in stop)
         if self._interruptions is not None or MinWordsUserTurnStartStrategy is None:
             return
-        controller = getattr(source, "_user_turn_controller", None)
         strategies = getattr(getattr(controller, "_user_turn_strategies", None), "start", None)
         if not isinstance(strategies, list) or not strategies:
             return
@@ -874,24 +895,25 @@ class _Capture:
         return max(0, _round((t - (self.t0 or t)) * 1000))
 
     def transcript(self, end_t: float) -> list[dict[str, Any]]:
-        """User and agent turns with text, by start time."""
-        turns: list[dict[str, Any]] = []
+        """User and agent turns with text, by start time. A caller turn neither VAD nor the service's turn frames
+        timed (a speech-to-speech model that reports none, such as Nova Sonic or Gemini Live) has only when its
+        transcript arrived, after the caller finished: it carries no times, and that arrival only orders it."""
+        timed: list[tuple[int, dict[str, Any]]] = []
+        self._line_at.clear()
         for user in self._user_turns:
             text = _cut(concatenate_aggregated_text(user["parts"]), _MAX_TEXT)
             if not text:
                 continue
-            turn = {
-                "id": user["id"],
-                "role": "user",
-                "text": text,
-                "start_ms": self._ms(user["start"]),
-            }
+            turn = {"id": user["id"], "role": "user", "text": text}
+            at = self._line_at[user["id"]] = self._ms(user["start"])
+            if user["vad"]:
+                turn["start_ms"] = at
             if user.get("confidences"):
                 turn["confidence"] = round(sum(user["confidences"]) / len(user["confidences"]), 4)
             end = user["end"] if user["end"] is not None else (end_t if user["vad"] else None)
-            if end is not None:
-                turn["end_ms"] = max(turn["start_ms"], self._ms(end))
-            turns.append(turn)
+            if end is not None and user["vad"]:
+                turn["end_ms"] = max(at, self._ms(end))
+            timed.append((at, turn))
         for agent in self._agent_turns:
             text = concatenate_aggregated_text(agent["tts"])
             # LLM text only when the call has no played TTS text at all, never for a cut-off turn
@@ -900,20 +922,23 @@ class _Capture:
             text = _cut(text, _MAX_TEXT)
             if not text:
                 continue
-            start = self._ms(agent["start"])
+            start = self._line_at[agent["id"]] = self._ms(agent["start"])
             end = agent["end"] if agent["end"] is not None else end_t
-            turns.append(
-                {
-                    "id": agent["id"],
-                    "role": "agent",
-                    "text": text,
-                    "start_ms": start,
-                    "end_ms": max(start, self._ms(end)),
-                    "interrupted": agent["interrupted"],
-                }
+            timed.append(
+                (
+                    start,
+                    {
+                        "id": agent["id"],
+                        "role": "agent",
+                        "text": text,
+                        "start_ms": start,
+                        "end_ms": max(start, self._ms(end)),
+                        "interrupted": agent["interrupted"],
+                    },
+                )
             )
-        turns.sort(key=lambda turn: turn["start_ms"])
-        return turns[:_MAX_TURNS]
+        timed.sort(key=lambda entry: entry[0])
+        return [turn for _, turn in timed][:_MAX_TURNS]
 
     def tool_calls(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
@@ -934,13 +959,19 @@ class _Capture:
                 item["is_error"] = True
             elif call.get("result") is not None:
                 item["is_error"] = False
-            item["turn_id"] = _tool_turn_id(start, transcript)
+            item["turn_id"] = _tool_turn_id(start, transcript, self._line_at)
             calls.append(_compact(item))
         return calls[:_MAX_TOOL_CALLS]
 
     def llm_requests(self) -> list[dict[str, Any]]:
         """Each LLM response and what became of it. A bot turn that spoke LLM text belongs to the last response
-        with output started before it: spoken, or cut off when the caller cut in."""
+        with output started before it: spoken, or cut off when the caller cut in. None from a service whose
+        response starts are stamped at its first output (_OUTPUT_STAMPED_LLMS)."""
+        llm = self._services.get("llm")
+        if llm is not None and any(
+            (cls.__module__, cls.__qualname__) in _OUTPUT_STAMPED_LLMS for cls in type(llm).__mro__
+        ):
+            return []
         heard: dict[int, bool] = {}  # response index -> cut off
         for turn in self._agent_turns:
             if not turn["llm"]:
@@ -985,7 +1016,9 @@ class _Capture:
             "llm_requests": _section("llm_requests", self.llm_requests),
             "errors": _section("errors", self.errors),
         }
-        return {k: v for k, v in diagnostics.items() if v} or None
+        # an empty errors list is sent: the observer sees every ErrorFrame, so none means the call had no failure
+        # (SuperBryn reads a missing list as not sent); a section that failed to build is None and stays out
+        return {k: v for k, v in diagnostics.items() if v or (k == "errors" and v == [])} or None
 
     def _service_config(self, role: str) -> dict[str, str] | None:
         service = self._services.get(role)
@@ -1011,10 +1044,15 @@ class _Capture:
         least = self._shortest_wait if self._shortest_wait is not None else vad
         if least is not None and most is not None:
             least = min(least, most)
+        realtime = self._pipeline() == "realtime"
         fields = {
-            "type": _label(self._turn_analyzer) or ("vad" if self._vad_seen else None),
+            # with no VAD or analyzer, a speech-to-speech service takes the turns itself
+            "type": _label(self._turn_analyzer)
+            or ("vad" if self._vad_seen else "realtime_llm" if realtime else None),
             "min_end_of_turn_ms": _round(least * 1000) if least is not None else None,
             "max_end_of_turn_ms": _round(most * 1000) if most else None,
+            # a speech-to-speech model answers when it decides the caller finished: no early drafts to speak of
+            "preemptive_generation": None if realtime else self._preemptive,
         }
         return _compact(fields) or None
 
@@ -1289,17 +1327,20 @@ def _ended_reason(frame: Any, fatal_error: bool) -> str | None:
     return None
 
 
-def _tool_turn_id(start_ms: int, transcript: list[dict[str, Any]]) -> str | None:
-    """The agent turn that started last before the call with no user turn between, else the next one."""
+def _tool_turn_id(
+    start_ms: int, transcript: list[dict[str, Any]], at: dict[str, int]
+) -> str | None:
+    """The agent turn that started last before the call with no user turn between, else the next one. at holds each
+    line's place on the observer's clock, an untimed caller line's included."""
     before = None
     for turn in transcript:
-        if turn["start_ms"] > start_ms:
+        if at[turn["id"]] > start_ms:
             break
         before = turn
     if before is not None and before["role"] == "agent":
         return before["id"]
     return next(
-        (t["id"] for t in transcript if t["role"] == "agent" and t["start_ms"] > start_ms), None
+        (t["id"] for t in transcript if t["role"] == "agent" and at[t["id"]] > start_ms), None
     )
 
 

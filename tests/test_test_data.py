@@ -583,7 +583,7 @@ async def test_event_bodies(clock, http):
     assert (body["event_id"], body["event"]) == ("pc:c-1:ended", "call.ended")
     assert (body["ended_at"], body["ended_reason"]) == ("2027-01-15T08:00:12.500Z", "ended")
     assert body["transcript"] == [] and body["tool_calls"] == []
-    assert "diagnostics" not in body
+    assert body["diagnostics"] == {"errors": []}  # nothing else to report, but no failure either
     request = http.requests[-1]
     assert request["url"] == "https://staging.example.com/public-api/v1/test-calls/agent-data"
     assert request["headers"] == {"X-API-Key": "sk_test", "Content-Type": "application/json"}
@@ -728,13 +728,14 @@ async def test_late_transcript_joins_the_turn_before_the_next_speech(clock, http
 
 
 async def test_without_vad_each_final_transcript_is_a_turn(clock, http):
+    # nothing timed the caller: a transcript's arrival comes after they finished, so the lines carry no times
     call = await Call(clock, superbryn_call_id="sb").start()
     await call.push(transcription("hi"), at=1)
     await call.push(transcription("are you there"), at=3)
     await call.end(at=4)
     assert ended(http)["transcript"] == [
-        {"id": "u1", "role": "user", "text": "hi", "start_ms": 1000},
-        {"id": "u2", "role": "user", "text": "are you there", "start_ms": 3000},
+        {"id": "u1", "role": "user", "text": "hi"},
+        {"id": "u2", "role": "user", "text": "are you there"},
     ]
 
 
@@ -1371,7 +1372,9 @@ async def test_a_tool_that_raised_or_does_not_exist_is_an_error(clock, http):
         ("c2", True),
         ("c3", False),
     ]
-    assert "errors" not in (body.get("diagnostics") or {})
+    assert (
+        body["diagnostics"]["errors"] == []
+    )  # a tool that failed is the tool call's error, not the pipeline's
 
 
 def audio(seconds: float, rate: int = 16000) -> InputAudioRawFrame:
@@ -2021,7 +2024,115 @@ async def test_endpointing_with_a_real_speech_timeout_strategy(http, monkeypatch
     # 0.2 s of VAD silence plus the strategy's 0.3 s wait; the VAD-only estimate said 200
     assert 500 <= entry["endpointingLatency"] <= entry["turnLatency"]
     detection = diagnostics["configuration"]["turn_detection"]
-    assert detection == {"type": "vad", "min_end_of_turn_ms": entry["endpointingLatency"]}
+    # the speech-timeout strategy starts the LLM only as the turn ends: no early drafts
+    assert detection == {
+        "type": "vad",
+        "min_end_of_turn_ms": entry["endpointingLatency"],
+        "preemptive_generation": False,
+    }
+
+
+async def test_llm_judged_turn_completion_drafts_replies_early_in_a_real_pipeline(
+    http, monkeypatch
+):
+    from pipecat.processors.aggregators.llm_response_universal import (
+        LLMUserAggregator,
+        LLMUserAggregatorParams,
+    )
+    from pipecat.turns.user_stop import (
+        LLMTurnCompletionUserTurnStopStrategy,
+        SpeechTimeoutUserTurnStopStrategy,
+        deferred,
+    )
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
+    # the detector starts the LLM; the LLM's own marker says whether the turn was complete (else it is dropped)
+    stop = [
+        deferred(SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.3)),
+        LLMTurnCompletionUserTurnStopStrategy(),
+    ]
+    params = LLMUserAggregatorParams(user_turn_strategies=UserTurnStrategies(stop=stop))
+    task = real_task(LLMUserAggregator(LLMContext(), params=params))
+
+    async def script():
+        await asyncio.sleep(0.1)
+        await task.queue_frame(VADUserStartedSpeakingFrame(start_secs=0.2, timestamp=time.time()))
+        await asyncio.sleep(0.2)
+        await task.queue_frame(transcription("what is my balance"))
+        await task.queue_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2, timestamp=time.time()))
+        await asyncio.sleep(0.5)
+        await task.queue_frame(EndFrame())
+
+    await run(task, script)
+    assert (
+        ended(http)["diagnostics"]["configuration"]["turn_detection"]["preemptive_generation"]
+        is True
+    )
+
+
+# Pipecat's speech-to-speech services that report no caller turns and stamp a response at its first output.
+OUTPUT_STAMPED = [
+    (
+        "pipecat.services.aws.nova_sonic.llm",
+        "AWSNovaSonicLLMService",
+        {"secret_access_key": "x", "access_key_id": "x", "region": "us-east-1"},
+    ),
+    ("pipecat.services.google.gemini_live.llm", "GeminiLiveLLMService", {"api_key": "x"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("module", "name", "kwargs"), OUTPUT_STAMPED, ids=["nova-sonic", "gemini-live"]
+)
+async def test_output_stamped_speech_to_speech_sends_no_requests_or_caller_times(
+    clock, http, module, name, kwargs
+):
+    # the real class; Pipecat raises ImportError without its aws / google extra
+    cls = getattr(pytest.importorskip(module, exc_type=ImportError), name)
+    assert (cls.__module__, cls.__qualname__) in td._OUTPUT_STAMPED_LLMS
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        llm = cls(**kwargs)
+    out = FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(
+        LLMFullResponseStartFrame(), at=2.9, source=llm
+    )  # the reply's first output, not its request
+    await call.push(
+        transcription("where is my order"), at=2.9, source=llm, direction=UP
+    )  # sent as the reply starts
+    await call.push(BotStartedSpeakingFrame(), at=3.2, source=out)
+    await call.push(tts_text("It shipped yesterday."), at=3.3, source=out)
+    await call.push(BotStoppedSpeakingFrame(), at=4.5, source=out)
+    await call.end(at=5)
+    body = ended(http)
+    assert body["transcript"][0] == {"id": "u1", "role": "user", "text": "where is my order"}
+    assert "llm_requests" not in body["diagnostics"]
+    assert body["diagnostics"]["configuration"]["turn_detection"] == {"type": "realtime_llm"}
+
+
+async def test_a_realtime_service_that_reports_turns_keeps_its_requests_and_caller_times(
+    clock, http
+):
+    llm, out = llm_service(model="gpt-realtime"), FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(
+        UserStartedSpeakingFrame(), at=1, source=llm
+    )  # OpenAI Realtime's own speech detection
+    await call.push(UserStoppedSpeakingFrame(), at=2.5, source=llm)
+    await call.push(
+        LLMFullResponseStartFrame(), at=2.7, source=llm
+    )  # its response item, before any audio
+    await call.push(transcription("where is my order"), at=2.9, source=llm, direction=UP)
+    await call.push(BotStartedSpeakingFrame(), at=3.2, source=out)
+    await call.push(LLMTextFrame("It shipped yesterday."), at=3.2, source=llm)
+    await call.push(tts_text("It shipped yesterday."), at=3.3, source=out)
+    await call.push(BotStoppedSpeakingFrame(), at=4.5, source=out)
+    await call.end(at=5)
+    body = ended(http)
+    assert (body["transcript"][0]["start_ms"], body["transcript"][0]["end_ms"]) == (1000, 2500)
+    assert body["diagnostics"]["llm_requests"] == [{"start_ms": 2700, "outcome": "spoken"}]
 
 
 async def test_muted_speech_in_a_real_pipeline(http, monkeypatch):
