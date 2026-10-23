@@ -98,6 +98,9 @@ jobs:
       - name: twine check
         run: twine check dist/*
 
+      - name: Package ships no harness or examples
+        run: python .github/scripts/check_dist_contents.py dist
+
       - name: Install wheel in fresh venv and import
         run: |
           python -m venv /tmp/verify-env
