@@ -72,6 +72,10 @@ jobs:
         if: steps.pypi.outputs.publish == 'true'
         run: python -m build
 
+      - name: Package ships no harness or examples
+        if: steps.pypi.outputs.publish == 'true'
+        run: python .github/scripts/check_dist_contents.py dist
+
       - name: Publish to PyPI
         if: steps.pypi.outputs.publish == 'true'
         env:
