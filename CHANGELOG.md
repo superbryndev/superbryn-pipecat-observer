@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-23
+
+Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/local_harness/`) and checked against production payloads.
+
+### Fixed
+- **Observer: every frame counted once per pipeline hop.** Pipecat calls an observer once for each link a frame crosses, and the observer handled every call. Each frame is now handled on its first push only (by frame id), and the upstream twin of a frame broadcast both ways is skipped. What this fixes:
+  - **Tool calls:** one record per call, not one per hop (production stored 13 per call).
+  - **Usage:** LLM tokens and TTS characters are no longer multiplied by the number of hops (3–6× too high).
+  - **Interruptions:** `interruption_count` and `bot_turns_interrupted` count each barge-in once (production showed 210 for 14 caller turns).
+  - **Pipeline section:** `frame_counts` are real frame counts.
+- **Observer: usage read 0 when the customer passed their own `PipelineParams`.** Pipecat sends usage (and service timings) only when asked. `monitor_and_create_task`, `simulate_and_create_task` and `register_task_handlers` now switch on `enable_usage_metrics` and `enable_metrics` unless the customer set one to `False`. In that case a `SUPERBRYN_PIPECAT_METRICS_OFF` warning is logged.
+- **Observer: agent turns duplicated or carrying words never said.** An agent turn is now one stretch of bot audio (`BotStartedSpeakingFrame` → `BotStoppedSpeakingFrame`), and its text is what the output transport played (`TTSTextFrame`). What this fixes:
+  - A short reply no longer appears twice, once from the LLM stream and once from TTS.
+  - A reply the caller cut off keeps only the words heard and carries `interrupted: true`.
+  - Pipelines that play no TTS text fall back to the LLM's streamed text.
+- **Observer: numbers split apart.** LLM tokens are joined the way Pipecat joins them, so "884" + "291" reads "884291", not "884 291".
+- **Observer: reply latency read far too low.** It ran from the last pipeline hop of the caller's turn to the LLM *starting*, so it was often below the LLM's own first-token time. It now runs from the caller's end of speech to the bot's first audio:
+  - **With VAD:** the end of speech is the VAD stop time minus its `stop_secs`.
+  - **Without VAD:** the turn's release.
+  - `latency.avg_ms` / `p95_ms` hold one value per reply.
+- **Observer: `metadata.transport` was empty** when the transport was passed to `monitor_and_create_task` (the README setup) instead of the constructor.
+- **Observer: Pipecat and agent logs were missing.** Pipecat and most Pipecat agents log through loguru, which the session log capture never saw. A loguru sink now feeds the same buffer as `logging`.
+- **Observer: the last reply's text could be cut.** With `register_task_handlers` (all `*_and_create_task` setups), the payload is now sent from `on_pipeline_finished`, after the pipeline drains, not on the first sight of the terminal frame.
+
+### Changed
+- Prompt-engineered `<tool_use>` blocks are lifted from each whole LLM response rather than from a transcript turn.
+
+### Added
+- `examples/local_harness/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request.
+- Agent transcript turns carry `interrupted`.
+
 ## [0.10.1] - 2026-10-22
 
 ### Fixed

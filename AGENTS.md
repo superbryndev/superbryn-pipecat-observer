@@ -54,8 +54,15 @@ test_import.py         # root-level smoke script (also run in CI)
 ```bash
 pip install -e ".[dev]"
 pytest -q                     # runs tests/ and test_import.py; no network needed
-ruff format && ruff check superbryn_pipecat_observer tests test_import.py
+ruff format && ruff check superbryn_pipecat_observer tests test_import.py examples/local_harness
+python examples/local_harness/run.py   # real Pipecat pipeline, both SDK paths, ~2 min; CI runs it
 ```
+
+- `examples/local_harness/` runs a scripted call through a real Pipecat pipeline
+  (aggregators, function calls, output transport, recorder) with stand-in
+  STT / LLM / TTS, and checks every payload field the observer and eval mode
+  send against what actually happened. A capture change that passes the unit
+  tests but miscounts in a real pipeline (once per hop, say) fails here.
 
 - The manifest schema mirrors the orchestration service's
   `AgentSyncManifest` (strict server-side validation). If the schema changes

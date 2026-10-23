@@ -30,16 +30,49 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check superbryn_pipecat_observer tests test_import.py
+        run: ruff check superbryn_pipecat_observer tests test_import.py examples/local_harness
 
       - name: Format check (ruff format)
-        run: ruff format --check superbryn_pipecat_observer tests test_import.py
+        run: ruff format --check superbryn_pipecat_observer tests test_import.py examples/local_harness
 
       - name: Smoke tests
         run: python test_import.py
 
       - name: Pytest
         run: pytest -q
+
+  harness:
+    # A scripted call through a real Pipecat pipeline, both SDK paths attached,
+    # every payload field checked against what actually happened. Catches
+    # capture bugs fakes can't (a frame counted once per pipeline hop, say).
+    name: Real-pipeline harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run every scenario
+        run: python examples/local_harness/run.py --dump harness-payloads
+
+      - name: Upload payloads
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-payloads
+          path: harness-payloads/
+          retention-days: 14
 
   build-verify:
     name: Build and install wheel in clean env
