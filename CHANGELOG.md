@@ -39,7 +39,7 @@ Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/
 - Dev tooling: pytest 9.1.1, ruff 0.17.2; GitHub Actions `checkout`, `setup-python` and `upload-artifact` to v7.
 
 ### Added
-- `examples/local_harness/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request.
+- `examples/local_harness/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request. `real_services.py` runs the same comparison against real Deepgram, OpenAI and Cartesia (not in CI: it needs keys and costs a few cents).
 - Agent transcript turns carry `interrupted`.
 
 ## [0.10.1] - 2026-10-22

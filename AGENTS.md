@@ -63,6 +63,10 @@ python examples/local_harness/run.py   # real Pipecat pipeline, both SDK paths, 
   STT / LLM / TTS, and checks every payload field the observer and eval mode
   send against what actually happened. A capture change that passes the unit
   tests but miscounts in a real pipeline (once per hop, say) fails here.
+- `examples/local_harness/real_services.py` runs the same check against real
+  Deepgram, OpenAI and Cartesia (keys needed, a few cents a run, not in CI).
+  Run it before a release that changes capture: `--env-file <.env>`, and once
+  with `--barge-in`.
 
 - The manifest schema mirrors the orchestration service's
   `AgentSyncManifest` (strict server-side validation). If the schema changes
