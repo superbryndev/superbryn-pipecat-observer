@@ -1,7 +1,7 @@
 """
 Real-services check: Deepgram, OpenAI and Cartesia behind the SDK, on this machine.
 
-The scripted harness (run.py) proves capture logic with stand-in services. This
+The scripted pipeline check (run.py) proves capture logic with stand-in services. This
 run swaps in the real ones: real streaming STT, real token streaming and usage,
 real word-timed TTS over a websocket, and Silero VAD deciding turns. The caller
 is recorded audio. Each service is wrapped to record what it reported to
@@ -12,8 +12,8 @@ Needs DEEPGRAM_API_KEY, OPENAI_API_KEY, CARTESIA_API_KEY (environment or
 --env-file) and pipecat-ai[deepgram,openai,cartesia,silero]. Not run in CI:
 it costs a few cents a run.
 
-    python examples/local_harness/real_services.py --env-file ../.env
-    python examples/local_harness/real_services.py --barge-in --dump out/
+    python examples/pipeline_check/real_services.py --env-file ../.env
+    python examples/pipeline_check/real_services.py --barge-in --dump out/
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ from scripted_services import LocalMockTransport  # noqa: E402
 
 from superbryn_pipecat_observer import SuperbrynObserver, attach_test_data  # noqa: E402
 
-API_KEY = "sb_local_harness"
+API_KEY = "sb_pipeline_check"
 AGENT_ID = "6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
 LLM_MODEL = "gpt-4.1-mini"
 VOICE_ID = "79a125e8-cd45-4c13-8a67-188112f4dd22"

@@ -67,9 +67,9 @@ def run_checks(
     def check(area: str, name: str, ok: Any, detail: Any = "") -> None:
         checks.append(Check(area, name, bool(ok), str(detail)))
 
-    check("harness", "scripted call ran without anomalies", not truth.anomalies, truth.anomalies)
+    check("setup", "scripted call ran without anomalies", not truth.anomalies, truth.anomalies)
     check(
-        "harness",
+        "setup",
         "caller interrupted the bot as scripted",
         truth.interruptions == want.interruptions,
         truth.interruptions,

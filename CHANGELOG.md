@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.11.0] - 2026-10-23
 
-Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/local_harness/`) and checked against production payloads.
+Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/pipeline_check/`) and checked against production payloads.
 
 ### Fixed
 - **Observer: every frame counted once per pipeline hop.** Pipecat calls an observer once for each link a frame crosses, and the observer handled every call. Each frame is now handled on its first push only (by frame id), and the upstream twin of a frame broadcast both ways is skipped. What this fixes:
@@ -39,7 +39,7 @@ Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/
 - Dev tooling: pytest 9.1.1, ruff 0.17.2; GitHub Actions `checkout`, `setup-python` and `upload-artifact` to v7.
 
 ### Added
-- `examples/local_harness/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request. `real_services.py` runs the same comparison against real Deepgram, OpenAI and Cartesia (not in CI: it needs keys and costs a few cents).
+- `examples/pipeline_check/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request. `real_services.py` runs the same comparison against real Deepgram, OpenAI and Cartesia (not in CI: it needs keys and costs a few cents).
 - Agent transcript turns carry `interrupted`.
 
 ## [0.10.1] - 2026-10-22

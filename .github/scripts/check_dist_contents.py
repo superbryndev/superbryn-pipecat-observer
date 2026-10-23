@@ -1,7 +1,7 @@
 """Fail the build if the wheel or sdist carries anything but the observer itself.
 
 The wheel may hold only the `superbryn_pipecat_observer` package and its
-`.dist-info`; neither file may hold `examples/` (the local harness lives there)
+`.dist-info`; neither file may hold `examples/` (the pipeline check lives there)
 at any depth, or a path that is absolute or climbs out with `..`.
 """
 

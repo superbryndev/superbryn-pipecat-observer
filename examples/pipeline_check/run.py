@@ -1,5 +1,5 @@
 """
-Real-pipeline harness for the SuperBryn Pipecat SDK — runs fully on this machine.
+Pipeline check for the SuperBryn Pipecat SDK — runs fully on this machine.
 
 A real Pipecat pipeline (aggregators, function calling, output transport,
 audio recorder) runs a scripted support call with stand-in STT / LLM / TTS.
@@ -9,9 +9,9 @@ local catcher instead of SuperBryn, and a checklist compares what each sent
 against what actually happened.
 
 Run (no API keys, no network, ~20s per scenario):
-    uv run python examples/local_harness/run.py                 # every scenario
-    uv run python examples/local_harness/run.py -s barge_in     # one scenario
-    uv run python examples/local_harness/run.py --dump out/     # save payloads
+    uv run python examples/pipeline_check/run.py                 # every scenario
+    uv run python examples/pipeline_check/run.py -s barge_in     # one scenario
+    uv run python examples/pipeline_check/run.py --dump out/     # save payloads
 """
 
 from __future__ import annotations
@@ -56,10 +56,10 @@ from scripted_services import (  # noqa: E402
 
 from superbryn_pipecat_observer import SuperbrynObserver, attach_test_data  # noqa: E402
 
-API_KEY = "sb_local_harness"
+API_KEY = "sb_pipeline_check"
 AGENT_ID = "6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
-AGENT_NAME = "local-harness-bot"
-CUSTOM_METADATA = {"campaign": "harness", "tenant_id": "acme-local"}
+AGENT_NAME = "pipeline-check-bot"
+CUSTOM_METADATA = {"campaign": "pipeline-check", "tenant_id": "acme-local"}
 
 SYSTEM_PROMPT = "You are Acme's support agent. Look up orders with lookup_order."
 GREETING = "Hello, thanks for calling Acme support. How can I help you today?"
@@ -214,7 +214,7 @@ async def run_call(scenario: Scenario, dump: Path | None = None) -> list[Check]:
         api_key=API_KEY,
         agent_id=AGENT_ID,
         base_url=catcher.base_url,
-        superbryn_call_id=f"harness-{scenario.name}",
+        superbryn_call_id=f"pipeline-check-{scenario.name}",
     )
     await task.queue_frames([TTSSpeakFrame(GREETING)])
 
