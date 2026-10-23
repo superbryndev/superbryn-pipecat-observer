@@ -11,6 +11,13 @@ from typing import Any
 from catcher import Caught
 from scripted_services import GroundTruth
 
+try:  # newer Pipecat reports STT usage itself
+    from pipecat.metrics.metrics import STTUsageMetricsData  # noqa: F401
+
+    STT_USAGE_REPORTED = True
+except ImportError:
+    STT_USAGE_REPORTED = False
+
 # Reported reply latency vs caller-measured end of speech → bot audio start
 LATENCY_TOLERANCE_MS = 250
 
@@ -164,12 +171,22 @@ def _obs_checks(check, caught, truth, want, session_id, wall_seconds) -> None:
         want,
     )
     stt = usage.get("stt_duration_seconds") or 0
-    check(
-        a,
-        "STT seconds within 0.6s of caller turns",
-        abs(stt - truth.user_turn_seconds) <= 0.6,
-        f"{stt} vs {truth.user_turn_seconds:.2f}",
-    )
+    if STT_USAGE_REPORTED:
+        # Pipecat measures the audio it hands the STT, pre-speech buffer included
+        check(
+            a,
+            "STT seconds = audio sent to the STT",
+            abs(stt - truth.stt_audio_seconds) <= 0.1,
+            f"{stt} vs {truth.stt_audio_seconds:.2f}",
+        )
+    else:
+        # Older Pipecat reports none; the observer falls back to the caller's turns
+        check(
+            a,
+            "STT seconds within 0.6s of caller turns",
+            abs(stt - truth.user_turn_seconds) <= 0.6,
+            f"{stt} vs {truth.user_turn_seconds:.2f}",
+        )
 
     # Metadata
     expected_meta = {

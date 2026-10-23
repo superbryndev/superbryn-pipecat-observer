@@ -163,7 +163,7 @@ async def run_call(scenario: Scenario, dump: Path | None = None) -> list[Check]:
 
     caller = ScriptedCaller(USER_LINES, truth, end_call, barge_in=scenario.barge_in)
     transport = LocalMockTransport(caller)
-    stt = ScriptedSTTService(USER_LINES)
+    stt = ScriptedSTTService(USER_LINES, truth)
     llm = ScriptedLLMService(
         llm_steps(scenario.first_reply), truth, token_delay=scenario.token_delay
     )

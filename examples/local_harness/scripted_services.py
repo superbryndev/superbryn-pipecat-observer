@@ -10,9 +10,11 @@ on a shared `GroundTruth` for the checklist to compare against.
 from __future__ import annotations
 
 import asyncio
+import io
 import math
 import re
 import time
+import wave
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,6 +61,8 @@ class GroundTruth:
     user_audio_seconds: float = 0.0
     # Speech plus the silence VAD waits for: what a turn-based STT duration covers
     user_turn_seconds: float = 0.0
+    # Audio the STT was handed (segments include the pre-speech buffer): what newer Pipecat reports as STT usage
+    stt_audio_seconds: float = 0.0
     # Caller-measured gap: end of caller speech → bot audio start, one per user turn
     perceived_latency_ms: list[float] = field(default_factory=list)
     llm_prompt_tokens: int = 0
@@ -207,15 +211,20 @@ class ScriptedCaller(FrameProcessor):
 class ScriptedSTTService(SegmentedSTTService):
     """Returns the next scripted line for each VAD segment it receives."""
 
-    def __init__(self, lines: list[str], delay: float = 0.15, **kwargs: Any) -> None:
+    def __init__(
+        self, lines: list[str], truth: GroundTruth, delay: float = 0.15, **kwargs: Any
+    ) -> None:
         super().__init__(settings=STTSettings(model="nova-3", language=None), **kwargs)
         self._lines = list(lines)
+        self._truth = truth
         self._delay = delay
 
     def can_generate_metrics(self) -> bool:
         return True
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        with wave.open(io.BytesIO(audio)) as segment:
+            self._truth.stt_audio_seconds += segment.getnframes() / segment.getframerate()
         await asyncio.sleep(self._delay)
         text = self._lines.pop(0) if self._lines else ""
         yield TranscriptionFrame(text=text, user_id="caller", timestamp=time_now_iso8601())
