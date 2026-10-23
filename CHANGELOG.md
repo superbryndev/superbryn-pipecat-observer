@@ -34,6 +34,9 @@ Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/
 ### Changed
 - Prompt-engineered `<tool_use>` blocks are lifted from each whole LLM response rather than from a transcript turn.
 
+### Security
+- Dev lock (`uv.lock`, not shipped in the package): aiohttp 3.14.5, certifi 2026.10.19, and Pillow 13.0.0 through a uv override, since pipecat-ai caps Pillow below 13. This clears the Dependabot alerts that have a fix. nltk (pulled in by pipecat-ai) has none yet.
+
 ### Added
 - `examples/local_harness/`: a scripted call through a real Pipecat pipeline (aggregators, function calling, output transport, recorder) with stand-in STT / LLM / TTS. It attaches both the observer and eval mode, and checks every payload field against what happened. There are five scenarios: sentence TTS, word-timed TTS, customer `PipelineParams`, barge-in, and a slow LLM. CI runs it on every pull request.
 - Agent transcript turns carry `interrupted`.
