@@ -149,8 +149,8 @@ def test_observer_rejects_record_audio_kwarg() -> None:
 #
 # The observer must now:
 #   * Capture every streamed token of a single bot response.
-#   * Lock a turn to the first text source (LLM or TTS) and drop the
-#     other, so the same content is never counted twice.
+#   * Take a turn's text from what was played (TTS words), so the LLM
+#     stream and the TTS words are never counted twice.
 #   * Still capture a `TTSSpeakFrame`-injected greeting (LLM bypassed)
 #     via the TTS's word-level `TTSTextFrame`s.
 
@@ -168,11 +168,25 @@ def _make_service(module_path):
     return type(f"Fake_{module_path.replace('.', '_')}", (), {"__module__": module_path})()
 
 
+def _make_output_transport():
+    """Fake output transport: the observer recognises it by its base class name."""
+    base = type("BaseOutputTransport", (), {})
+    return type("FakeOutputTransport", (base,), {})()
+
+
+def _agent_turns(obs):
+    return [
+        t for t in obs._build_payload()["call"]["transcript"]["turns"] if t["speaker"] == "agent"
+    ]
+
+
 def test_streaming_llm_tokens_are_all_captured() -> None:
     """Regression: an LLM response that streams as multiple `LLMTextFrame`s
-    must end up as a single agent turn containing the full concatenated text.
-    Previously only the first token was captured."""
+    must end up as a single agent turn containing the full concatenated text,
+    numbers included (an LLM streams "884291" as "884" + "291")."""
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
         LLMTextFrame,
@@ -182,25 +196,31 @@ def test_streaming_llm_tokens_are_all_captured() -> None:
 
     obs = SuperbrynObserver(agent_name="stream", api_key="sb_test")
     llm = _make_service("pipecat.services.anthropic.llm")
+    out = _make_output_transport()
 
     async def drive() -> None:
+        await obs.on_pipeline_started()
         await obs.on_push_frame(_make_frame_pushed(LLMFullResponseStartFrame(), llm))
-        for token in ["Hello", " there", ",", " how", " can", " I", " help", "?"]:
+        for token in ["Hello", " there", ",", " order", " 884", "291", "?"]:
             await obs.on_push_frame(_make_frame_pushed(LLMTextFrame(text=token), llm))
         await obs.on_push_frame(_make_frame_pushed(LLMFullResponseEndFrame(), llm))
+        await obs.on_push_frame(_make_frame_pushed(BotStartedSpeakingFrame(), out))
+        await obs.on_push_frame(_make_frame_pushed(BotStoppedSpeakingFrame(), out))
 
     asyncio.run(drive())
 
-    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    agent_turns = _agent_turns(obs)
     assert len(agent_turns) == 1
-    assert agent_turns[0]["text"] == "Hello there, how can I help?"
+    assert agent_turns[0]["text"] == "Hello there, order 884291?"
 
 
 def test_llm_stream_and_tts_word_frames_do_not_double_count() -> None:
     """Regression: a word-timestamp TTS (Cartesia) emits `TTSTextFrame` per
-    spoken word for content the LLM already streamed. The observer must
-    capture from exactly one source (LLM here) and drop the other."""
+    spoken word for content the LLM already streamed. The turn's text is
+    the played words, once."""
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
         LLMTextFrame,
@@ -212,30 +232,32 @@ def test_llm_stream_and_tts_word_frames_do_not_double_count() -> None:
 
     obs = SuperbrynObserver(agent_name="dup", api_key="sb_test")
     llm = _make_service("pipecat.services.anthropic.llm")
-    tts = _make_service("pipecat.services.cartesia.tts")
+    out = _make_output_transport()
 
     async def drive() -> None:
+        await obs.on_pipeline_started()
         await obs.on_push_frame(_make_frame_pushed(LLMFullResponseStartFrame(), llm))
         for token in ["Hello", " there"]:
             await obs.on_push_frame(_make_frame_pushed(LLMTextFrame(text=token), llm))
+        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseEndFrame(), llm))
+        await obs.on_push_frame(_make_frame_pushed(BotStartedSpeakingFrame(), out))
         for word in ["Hello", "there"]:
             frame = TTSTextFrame(text=word, aggregated_by=AggregationType.TOKEN)
-            await obs.on_push_frame(_make_frame_pushed(frame, tts))
-        await obs.on_push_frame(_make_frame_pushed(LLMFullResponseEndFrame(), llm))
+            await obs.on_push_frame(_make_frame_pushed(frame, out))
+        await obs.on_push_frame(_make_frame_pushed(BotStoppedSpeakingFrame(), out))
 
     asyncio.run(drive())
 
-    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    agent_turns = _agent_turns(obs)
     assert len(agent_turns) == 1
     assert agent_turns[0]["text"] == "Hello there"
 
 
 def test_tts_speak_greeting_is_captured_via_tts_words() -> None:
     """Regression: a `TTSSpeakFrame` injection (pre-baked greeting) has no
-    LLM stream. The observer must open the bot turn on `TTSSpeakFrame`
-    early enough that the TTS service's word-level `TTSTextFrame`s land
-    inside it — the greeting text was previously missing entirely."""
+    LLM stream; its played words still make the greeting turn."""
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
         BotStoppedSpeakingFrame,
         TTSSpeakFrame,
         TTSTextFrame,
@@ -245,22 +267,22 @@ def test_tts_speak_greeting_is_captured_via_tts_words() -> None:
     from superbryn_pipecat_observer import SuperbrynObserver
 
     obs = SuperbrynObserver(agent_name="greet", api_key="sb_test")
-    tts = _make_service("pipecat.services.cartesia.tts")
     pipeline_source = _make_service("pipecat.pipeline.pipeline")
+    out = _make_output_transport()
 
     async def drive() -> None:
-        greeting = "Hi, welcome to the cafe."
-        greeting_frame = TTSSpeakFrame(text=greeting)
+        await obs.on_pipeline_started()
+        greeting_frame = TTSSpeakFrame(text="Hi, welcome to the cafe.")
         await obs.on_push_frame(_make_frame_pushed(greeting_frame, pipeline_source))
-        await obs.on_push_frame(_make_frame_pushed(greeting_frame, pipeline_source))
+        await obs.on_push_frame(_make_frame_pushed(BotStartedSpeakingFrame(), out))
         for word in ["Hi,", "welcome", "to", "the", "cafe."]:
             frame = TTSTextFrame(text=word, aggregated_by=AggregationType.TOKEN)
-            await obs.on_push_frame(_make_frame_pushed(frame, tts))
-        await obs.on_push_frame(_make_frame_pushed(BotStoppedSpeakingFrame(), tts))
+            await obs.on_push_frame(_make_frame_pushed(frame, out))
+        await obs.on_push_frame(_make_frame_pushed(BotStoppedSpeakingFrame(), out))
 
     asyncio.run(drive())
 
-    agent_turns = [t for t in obs.transcript_turns if t["speaker"] == "agent"]
+    agent_turns = _agent_turns(obs)
     assert len(agent_turns) == 1, f"expected 1 agent turn, got {len(agent_turns)}"
     assert agent_turns[0]["text"] == "Hi, welcome to the cafe."
 

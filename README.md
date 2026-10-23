@@ -1,6 +1,6 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.10.1-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.11.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
@@ -13,11 +13,11 @@ Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI a
 - **Transport-agnostic** — same code works on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket. No carrier credentials needed.
 - **Precise transcripts** — speaker turns with timestamps, confidence scores, and per-turn bot latency.
 - **Usage metrics** — LLM tokens (in / out), STT seconds, TTS characters, captured automatically from Pipecat's `MetricsFrame`.
-- **Latency tracking** — average and p95 response time between user stop and bot start.
+- **Latency tracking** — average and p95 response time from the caller's end of speech to the bot's first audio.
 - **Provider auto-detection** — LLM / STT / TTS provider, model, and voice ID inferred from the service modules in your pipeline.
 - **Tool-call capture** — both real Pipecat tools (`FunctionCallInProgressFrame` / `FunctionCallResultFrame`) and Anthropic-style `<tool_use>` prompt tools.
 - **UAT / simulation mode** — `simulate_and_create_task` suppresses billing for non-production runs.
-- **Session log capture** — buffer INFO+ logs from the call window and attach them to the payload.
+- **Session log capture** — buffer INFO+ logs (`logging` and loguru) from the call window and attach them to the payload.
 - **Custom metadata** — attach any key/value bag to the call record; mutable mid-session.
 - **Turn-detection latency** — end-to-end turn-completion timing and confidence, the hidden part of response latency.
 - **Per-service timings** — real TTFB / TTFA (with silence padding split out) / processing time, broken down by service.
@@ -81,18 +81,19 @@ For UAT / simulation calls that shouldn't be billed or analyzed, use `simulate_a
 - Speaker turns (`user` / `agent`)
 - Per-turn `start_time_ms` / `end_time_ms` (relative to call start)
 - Per-turn `confidence` (when the STT provider reports it)
-- Per-bot-turn `latency_ms` (gap between user stop and bot response start)
-- Streaming LLM chunks (`LLMTextFrame`) are merged into a single turn per response
+- Per-bot-turn `latency_ms` (caller's end of speech → bot audio start)
+- One agent turn per stretch of bot audio; its text is what was played (TTS text), so a reply the caller cut off keeps only the words heard and carries `interrupted: true`
+- Pipelines that play no TTS text fall back to the LLM's streamed text
 - Empty turns are filtered out before send
 
 ### Usage Metrics
-Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, set automatically by `monitor_and_create_task`):
+Captured from Pipecat's `MetricsFrame`. Pipecat sends them only with `enable_usage_metrics=True` (and service timings with `enable_metrics=True`); the observer switches both on, including on your own `PipelineParams`, unless you set one to `False`:
 - **LLM** — input tokens, output tokens, model, provider
 - **TTS** — character count, model, provider, voice ID
 - **STT** — seconds of audio processed, model, provider (with a VAD-derived fallback when the provider doesn't report)
 
 ### Latency
-- Per-turn response delay (user stop → bot speak start)
+- Per-turn response delay (caller's end of speech → bot audio start)
 - Aggregated **average** and **p95** across the call
 
 ### Session Metadata
@@ -106,11 +107,12 @@ Captured from Pipecat's `MetricsFrame` (requires `enable_usage_metrics=True`, se
 
 ### Tool Calls
 - Real Pipecat tools — paired from `FunctionCallInProgressFrame` + `FunctionCallResultFrame` by `tool_call_id`
-- Anthropic-style prompt tool calls — `<tool_use>{...}</tool_use>` blocks extracted from bot turns and lifted onto `call.tool_calls` (XML is stripped from the visible transcript)
+- Anthropic-style prompt tool calls — `<tool_use>{...}</tool_use>` blocks extracted from each LLM response and lifted onto `call.tool_calls` (XML is stripped from the visible transcript)
+- One record per tool call, however many processors the frames pass through
 - Each record carries `function_name`, `arguments`, `result`, `timestamp_ms`, and `tool_call_id`
 
 ### Session Logs (opt-in)
-- INFO+ records from the agent process during the call window
+- INFO+ records from the agent process during the call window, from both `logging` and loguru (which Pipecat uses)
 - Bounded by `max_log_records` (default 1000) so a chatty agent can't blow up the payload
 - Disable with `capture_logs=False`
 
@@ -266,7 +268,7 @@ Latency and usage need `enable_metrics=True` and `enable_usage_metrics=True` in 
 ```json
 {
   "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.10.1",
+  "sdk_version": "@superbryn/pipecat-observer@0.11.0",
   "call": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "started_at": "2026-06-15T12:00:00.000+00:00",
@@ -304,7 +306,7 @@ Latency and usage need `enable_metrics=True` and `enable_usage_metrics=True` in 
       "tts_provider": "cartesia",
       "tts_model": "sonic-english",
       "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.10.1",
+      "pipeline_version": "@superbryn/pipecat-observer@0.11.0",
       "mode": "observe"
     },
     "usage": {
@@ -429,7 +431,7 @@ logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
 
 ### Missing usage metrics
 
-Pipecat only emits `MetricsFrame`s when usage metrics are enabled. `monitor_and_create_task` / `simulate_and_create_task` set this for you. If you build your own `PipelineTask`, pass `enable_usage_metrics=True`:
+Pipecat only emits `MetricsFrame`s when usage metrics are enabled. `monitor_and_create_task` / `simulate_and_create_task` / `register_task_handlers` switch it on for you, also on your own `PipelineParams`, unless you set `enable_usage_metrics=False` (a `SUPERBRYN_PIPECAT_METRICS_OFF` warning is logged). If you attach the observer to your own `PipelineTask` without `register_task_handlers`, pass `enable_usage_metrics=True`:
 
 ```python
 PipelineTask(

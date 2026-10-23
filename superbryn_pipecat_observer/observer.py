@@ -28,6 +28,7 @@ import platform
 import re
 import uuid
 import warnings
+from collections import deque
 from datetime import UTC, datetime
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -45,9 +46,14 @@ except Exception:  # pragma: no cover - import error surfaced clearly to the cal
     BaseObserver = object  # type: ignore[assignment,misc]
     FramePushed = Any  # type: ignore[assignment,misc]
 
+try:
+    from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
+except Exception:  # pragma: no cover - older pipecat: parts are joined with spaces
+    TextPartForConcatenation = concatenate_aggregated_text = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 
 # Frame class names that signal the call/pipeline is wrapping up. Pipecat 1.3
@@ -56,21 +62,18 @@ _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 # observer-level `on_pipeline_finished` lifecycle hook.
 _TERMINAL_FRAME_NAMES = ("EndFrame", "StopFrame", "CancelFrame")
 
-# Frame class names that carry assistant-side spoken/streamed text we want
-# to capture as a bot turn. Matched by ``type(frame).__name__`` so we don't
-# have to import the concrete classes (Pipecat renames them between
-# minor releases). Includes:
+# Frame class names that carry LLM output text. Matched by
+# ``type(frame).__name__`` so we don't have to import the concrete classes
+# (Pipecat renames them between minor releases). Includes:
 #   - "TextFrame"           — legacy Pipecat <= 1.2 LLM streaming output.
 #   - "LLMTextFrame"        — Pipecat 1.3+ subclass for LLM streamed text.
 #   - "LLMFullResponseFrame"— Pipecat 1.3+ end-of-response aggregated text
 #                             (some providers emit this instead of streaming).
-#   - "TTSTextFrame"        — pipelines that push text through TTS before
-#                             the LLM aggregator sees it.
-_BOT_TEXT_FRAME_NAMES = (
+# Spoken text ("TTSTextFrame") is taken where the output transport plays it.
+_LLM_TEXT_FRAME_NAMES = (
     "TextFrame",
     "LLMTextFrame",
     "LLMFullResponseFrame",
-    "TTSTextFrame",
 )
 
 # Matches Anthropic-style prompt-engineered tool calls that arrive as plain
@@ -89,6 +92,13 @@ _BOT_TEXT_FRAME_NAMES = (
 # multiple `<tool_use>` blocks parses as multiple calls instead of one
 # spanning the entire turn. DOTALL lets the inner JSON span newlines.
 _TOOL_USE_PATTERN = re.compile(r"<tool_use>\s*(\{.*?\})\s*</tool_use>", re.DOTALL)
+
+# Frames handled on an upstream push too: errors travel upstream, and
+# speech-to-speech services push the caller's transcript upstream.
+_UPSTREAM_FRAME_NAMES = ("ErrorFrame", "FatalErrorFrame", "TranscriptionFrame")
+
+# How many recent frame ids are remembered to handle each frame once
+_DEDUPE_WINDOW = 2000
 
 # Extended-capture payload bounds — keep the webhook body small on long calls
 _MAX_TURN_EVENTS = 200
@@ -151,6 +161,36 @@ def _json_safe(obj: Any) -> Any:
     except (TypeError, ValueError) as exc:
         logger.warning("extended sections not JSON-serializable, omitting them: %s", exc)
         return {}
+
+
+def _is_upstream(data: Any) -> bool:
+    return getattr(getattr(data, "direction", None), "name", "") == "UPSTREAM"
+
+
+def _is_output_transport(processor: Any) -> bool:
+    if processor is None:
+        return False
+    return any(cls.__name__ == "BaseOutputTransport" for cls in type(processor).__mro__)
+
+
+def _text_part(frame: Any) -> Any:
+    """A text frame as a joinable part; keeps whether its text already carries spacing."""
+    text = getattr(frame, "text", None)
+    if not isinstance(text, str) or not text:
+        return None
+    spaced = bool(getattr(frame, "includes_inter_frame_spaces", False))
+    if TextPartForConcatenation is None:
+        return (text, spaced)
+    return TextPartForConcatenation(text, spaced)
+
+
+def _join_parts(parts: list[Any]) -> str:
+    """Join streamed text the way Pipecat's aggregators do, so "884" + "291" stays "884291"."""
+    if not parts:
+        return ""
+    if concatenate_aggregated_text is None:
+        return " ".join(text.strip() for text, _ in parts)
+    return concatenate_aggregated_text(parts)
 
 
 def _coerce_tool_payload(value: Any) -> Any:
@@ -288,11 +328,11 @@ class SuperbrynObserver(BaseObserver):
         # Accepts either a plain string (legacy 0.1.x usage) or a
         # Pipecat transport instance. Unknown shapes degrade to None.
         self._transport_obj: Any | None = None
+        self.transport: str | None = None
         if transport is None or isinstance(transport, str):
             self.transport = transport
         else:
-            self._transport_obj = transport
-            self.transport = type(transport).__name__.lower().replace("transport", "") or None
+            self._adopt_transport(transport)
 
         self.from_number = from_number
         self.to_number = to_number
@@ -340,8 +380,8 @@ class SuperbrynObserver(BaseObserver):
         self.ended_at: datetime | None = None
         self._call_start_ms: int | None = None
 
+        # User turns, one per final transcription
         self.transcript_turns: list[dict[str, Any]] = []
-        self._last_user_end_ms: int | None = None
 
         # VAD-derived fallback for `stt_duration_seconds`. We track the
         # start of every user-speaking segment and accumulate total
@@ -351,34 +391,29 @@ class SuperbrynObserver(BaseObserver):
         self._user_speech_start_ms: int | None = None
         self._vad_user_speech_ms: int = 0
 
-        # Streaming-LLM bot-turn accumulator. Set True when we open a
-        # placeholder turn on the first BotStartedSpeakingFrame /
-        # LLMFullResponseStartFrame and reset when the matching stopped /
-        # end frame fires. Prevents the same conceptual response from
-        # producing multiple turns when the start/stop frames propagate
-        # across several pipeline links.
-        self._bot_turn_open: bool = False
+        # Agent turns: one per stretch of bot audio (BotStarted → BotStopped).
+        # Text is what the output transport played (TTSTextFrame); LLM text
+        # is the fallback for pipelines that play none. Text that arrives
+        # before the bot starts speaking waits in the pending lists.
+        self._agent_turns: list[dict[str, Any]] = []
+        self._agent_turn: dict[str, Any] | None = None
+        self._pending_tts: list[Any] = []
+        self._pending_llm: list[Any] = []
+        self._tts_played = False
+        # Raw text of the LLM response in flight, for prompt tool calls
+        self._response_text: list[str] | None = None
+        self._response_start_ms: int | None = None
 
-        # Per-turn first-source-wins guard for bot-text capture.
-        #
-        # Pipecat emits bot text in TWO independent streams:
-        #   1. LLM services push `LLMTextFrame` tokens as the model streams
-        #      its response (source = pipecat.services.<vendor>.llm).
-        #   2. TTS services with word-timestamp support (Cartesia,
-        #      ElevenLabs, …) push `TTSTextFrame` per word during audio
-        #      playback (source = pipecat.services.<vendor>.tts).
-        #
-        # For a single LLM-driven response BOTH streams carry the same
-        # content, so capturing from both would duplicate every word in
-        # the transcript. For a `TTSSpeakFrame`-injected utterance (a
-        # pre-baked greeting queued via `task.queue_frames`) the LLM
-        # stream is silent — only TTS emits text.
-        #
-        # We resolve this by locking each turn to the first source that
-        # contributes text: LLM if the LLM ran, TTS if only TTS ran. The
-        # lock is cleared in `_close_bot_turn` so the next turn is free
-        # to pick its own source.
-        self._current_turn_text_source: str | None = None
+        # Reply latency: caller's end of speech → bot audio start
+        self._speech_end_ms: int | None = None
+        self._awaiting_reply = False
+        self._vad_seen = False
+
+        # Frames already handled (on_push_frame fires once per pipeline hop)
+        self._seen_ids: set[int] = set()
+        self._seen_order: deque[int] = deque()
+        # Set once on_pipeline_finished is hooked: finalize then waits for the drain
+        self._finish_hooked = False
 
         # Tool / function-call invocations made by the LLM during the call.
         # Pipecat emits `FunctionCallInProgressFrame` when the LLM decides to
@@ -440,7 +475,6 @@ class SuperbrynObserver(BaseObserver):
         self._frame_counts: dict[str, int] = {}
         self._vad_speech_start_ms: int | None = None
         self._vad_params: dict[str, float] = {}
-        self._bot_speaking = False
 
         # Deferred-upload / consent gate (Cekura parity). When set, the
         # SDK still captures audio + transcript locally but holds the S3
@@ -468,6 +502,7 @@ class SuperbrynObserver(BaseObserver):
         self._max_log_records = max(0, int(max_log_records))
         self._captured_logs: list[dict[str, Any]] = []
         self._log_handler: logging.Handler | None = None
+        self._loguru_sink_id: int | None = None
         self._prev_root_log_level: int | None = None
 
         # Runtime kill-switch. The explicit `enabled` arg wins; the env var
@@ -657,6 +692,7 @@ class SuperbrynObserver(BaseObserver):
         individually. Extra ``PipelineTask`` kwargs are forwarded
         as-is.
         """
+        self._adopt_transport(transport)
         pipeline = self.monitor_pipeline(
             pipeline,
             context,
@@ -681,6 +717,7 @@ class SuperbrynObserver(BaseObserver):
         **pipeline_task_kwargs: Any,
     ) -> Any:
         """Single-step UAT setup. See :meth:`monitor_and_create_task`."""
+        self._adopt_transport(transport)
         pipeline = self.simulate_pipeline(
             pipeline,
             context,
@@ -750,10 +787,16 @@ class SuperbrynObserver(BaseObserver):
         client-disconnect events so a hard hangup still triggers finalize
         even if Pipecat's terminal frames are swallowed during teardown.
 
+        Also switches on the usage and timing metrics the payload is built
+        from, unless the customer turned them off on purpose.
+
         Returns the task so callers can chain.
         """
+        self._adopt_transport(transport)
+        self._ensure_metrics(task)
         register = getattr(task, "event_handler", None)
         if register is not None:
+            self._finish_hooked = True
 
             @register("on_pipeline_finished")  # type: ignore[misc]
             async def _on_finished(*_args: Any, **_kwargs: Any) -> None:  # noqa: ANN401
@@ -765,6 +808,39 @@ class SuperbrynObserver(BaseObserver):
             self._register_transport_disconnect(transport)
 
         return task
+
+    def _adopt_transport(self, transport: Any | None) -> None:
+        """Keep a live transport object for recorder placement and label the call with its kind."""
+        if transport is None or isinstance(transport, str) or self._transport_obj is not None:
+            return
+        self._transport_obj = transport
+        if not self.transport:
+            self.transport = type(transport).__name__.lower().replace("transport", "") or None
+
+    @staticmethod
+    def _ensure_metrics(task: Any) -> None:
+        """Pipecat sends usage (tokens, TTS characters) and timing (TTFB) metrics only when
+        asked. A customer's own ``PipelineParams`` usually leaves one unset, which used to
+        report 0 tokens; switch on what was left unset, and keep what was turned off."""
+        params = getattr(task, "params", None)
+        if params is None:
+            return
+        chosen = getattr(params, "model_fields_set", set())
+        for name in ("enable_usage_metrics", "enable_metrics"):
+            if getattr(params, name, True):
+                continue
+            if name in chosen:
+                logger.warning(
+                    "SUPERBRYN_PIPECAT_METRICS_OFF: %s=False in PipelineParams, so the call "
+                    "carries no %s",
+                    name,
+                    "token or TTS usage" if name == "enable_usage_metrics" else "service timings",
+                )
+                continue
+            try:
+                setattr(params, name, True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("could not switch on %s: %s", name, exc)
 
     # ── Backward-compatible alias ────────────────────────────────────────
 
@@ -866,7 +942,9 @@ class SuperbrynObserver(BaseObserver):
         """Attach a buffering handler to the root logger so INFO+ records
         from anywhere in the agent process get captured into
         ``self._captured_logs``. Bounded by ``_max_log_records`` so a
-        chatty agent can't blow up the webhook payload.
+        chatty agent can't blow up the webhook payload. Pipecat and most
+        Pipecat agents log through loguru, so a loguru sink feeds the
+        same buffer.
         """
         if not self._capture_logs or self._log_handler is not None or self._max_log_records == 0:
             return
@@ -910,8 +988,45 @@ class SuperbrynObserver(BaseObserver):
             self._prev_root_log_level = root.level
             root.setLevel(logging.INFO)
         self._log_handler = handler
+        self._attach_loguru_sink()
+
+    def _attach_loguru_sink(self) -> None:
+        try:
+            from loguru import logger as loguru_logger
+        except Exception:  # noqa: BLE001 — loguru ships with pipecat; absent means nothing to capture
+            return
+        observer = self
+
+        def sink(message: Any) -> None:
+            record = message.record
+            name = record["name"] or ""
+            if name.startswith("superbryn_pipecat_observer"):
+                return
+            if len(observer._captured_logs) >= observer._max_log_records:
+                return
+            observer._captured_logs.append(
+                {
+                    "ts": record["time"].astimezone(UTC).isoformat(),
+                    "level": record["level"].name,
+                    "name": name,
+                    "message": record["message"],
+                }
+            )
+
+        try:
+            self._loguru_sink_id = loguru_logger.add(sink, level="INFO", format="{message}")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("loguru sink attach skipped: %s", exc)
 
     def _detach_log_handler(self) -> None:
+        if self._loguru_sink_id is not None:
+            try:
+                from loguru import logger as loguru_logger
+
+                loguru_logger.remove(self._loguru_sink_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("loguru sink detach swallowed: %s", exc)
+            self._loguru_sink_id = None
         if self._log_handler is None:
             return
         root = logging.getLogger()
@@ -1069,7 +1184,7 @@ class SuperbrynObserver(BaseObserver):
 
         params = pipeline_task_kwargs.pop("params", None)
         if params is None:
-            params = PipelineParams(enable_usage_metrics=True)
+            params = PipelineParams(enable_metrics=True, enable_usage_metrics=True)
 
         return PipelineTask(pipeline, observers=observers, params=params, **pipeline_task_kwargs)
 
@@ -1228,9 +1343,12 @@ class SuperbrynObserver(BaseObserver):
         """
         Inspect frames as they flow between processors.
 
-        Pipecat's frame names move occasionally — we look up by class name
-        instead of importing concrete frame types, so a Pipecat upgrade
-        doesn't hard-break the observer when new frames are added.
+        Pipecat calls this once per hop, so each frame is handled on its
+        first push only (by frame id), and the upstream twin of a frame
+        broadcast both ways is skipped. Counting every hop multiplied
+        usage, tool calls and interruptions by the pipeline's length.
+        Frames are matched by class name, not imported, so a Pipecat
+        upgrade doesn't hard-break the observer.
         """
         try:
             frame = getattr(data, "frame", None)
@@ -1241,66 +1359,43 @@ class SuperbrynObserver(BaseObserver):
             source = getattr(data, "source", None)
             source_module = type(source).__module__ if source is not None else ""
 
+            if cls_name == "TTSTextFrame":
+                # Spoken text counts once the output transport has played it
+                if _is_output_transport(source) and self._first_time(frame):
+                    self._capture_spoken_text(frame)
+                    if self._extended_capture:
+                        self._capture_extended_frame(frame, cls_name, source, source_module)
+                return
+            # Errors and speech-to-speech transcripts also travel upstream
+            if _is_upstream(data) and cls_name not in _UPSTREAM_FRAME_NAMES:
+                return
+            sibling = getattr(frame, "broadcast_sibling_id", None)
+            if sibling is not None and sibling in self._seen_ids:
+                return
+            if not self._first_time(frame):
+                return
+
             if cls_name == "TranscriptionFrame":
-                # ``TranscriptionFrame`` traverses every downstream
-                # processor (STT → user aggregator → LLM → …). Pipecat
-                # fires ``on_push_frame`` once per link, so without this
-                # source filter we'd register the same user turn 4-5
-                # times. Capture only on the first hop (from the STT
-                # service itself).
-                if "pipecat.services." in source_module and "stt" in source_module:
-                    self._capture_user_turn(frame)
-            elif cls_name == "TTSSpeakFrame":
-                # ``TTSSpeakFrame`` is a direct text-to-TTS injection that
-                # bypasses the LLM entirely (e.g. a pre-baked greeting
-                # queued at call start via ``task.queue_frames``). Pipecat
-                # never emits ``LLMFullResponseStartFrame`` for this path,
-                # so nothing opens a bot turn early. Meanwhile the TTS
-                # service starts pushing ``TTSTextFrame``s (with the actual
-                # word-level text) before the output transport gets around
-                # to emitting ``BotStartedSpeakingFrame`` — those early
-                # ``TTSTextFrame``s arrive at the observer with
-                # ``_bot_turn_open=False`` and would be dropped.
-                #
-                # We open the bot turn *early* here so the subsequent
-                # ``TTSTextFrame``s land in it. We deliberately DO NOT
-                # capture the ``TTSSpeakFrame`` text itself — otherwise it
-                # would double-count with the ``TTSTextFrame``s that carry
-                # the same content. ``_mark_bot_response_start`` is
-                # idempotent via ``_bot_turn_open``, so a ``TTSSpeakFrame``
-                # observed on multiple pipeline hops (no source filter is
-                # applied) doesn't open duplicate turns.
-                self._mark_bot_response_start()
-            elif cls_name in _BOT_TEXT_FRAME_NAMES and self._looks_like_bot_text(frame):
-                # Same dedupe problem for bot text. ``LLMTextFrame`` (and
-                # subclasses) flow from the LLM service through TTS,
-                # AudioBufferProcessor, output transport, and assistant
-                # aggregator — each link fires ``on_push_frame``. Capture
-                # only on the producer-side hop so a single LLM token
-                # becomes a single appended chunk in the turn buffer
-                # (not 3-4 duplicate appends).
-                if "pipecat.services." in source_module and (
-                    "llm" in source_module or "tts" in source_module
-                ):
-                    # First-source-wins per turn. Word-timestamp TTS
-                    # services (Cartesia, ElevenLabs) emit `TTSTextFrame`
-                    # per spoken word for the *same* content the LLM
-                    # already streamed as `LLMTextFrame`s — capturing
-                    # both duplicates every word. Lock the turn to the
-                    # first source we see and drop the other.
-                    source_kind = "llm" if "llm" in source_module else "tts"
-                    if self._current_turn_text_source is None:
-                        self._current_turn_text_source = source_kind
-                    if self._current_turn_text_source == source_kind:
-                        self._capture_bot_turn(frame)
-            elif cls_name in ("LLMFullResponseStartFrame", "BotStartedSpeakingFrame"):
-                self._mark_bot_response_start()
-            elif cls_name in ("LLMFullResponseEndFrame", "BotStoppedSpeakingFrame"):
-                # Close the open bot turn so the next response starts a
-                # fresh turn instead of appending to the previous one.
-                self._close_bot_turn()
+                self._capture_user_turn(frame)
+            elif cls_name in _LLM_TEXT_FRAME_NAMES:
+                if "pipecat.services." in source_module:
+                    self._capture_llm_text(frame)
+            elif cls_name == "LLMFullResponseStartFrame":
+                self._response_started()
+            elif cls_name == "LLMFullResponseEndFrame":
+                self._response_ended()
+            elif cls_name == "BotStartedSpeakingFrame":
+                self._bot_started()
+            elif cls_name == "BotStoppedSpeakingFrame":
+                self._bot_stopped()
+            elif cls_name == "InterruptionFrame":
+                self._interrupted()
             elif cls_name == "MetricsFrame":
                 self._capture_metrics(frame)
+            elif cls_name == "VADUserStartedSpeakingFrame":
+                self._awaiting_reply = False
+            elif cls_name == "VADUserStoppedSpeakingFrame":
+                self._caller_silent(frame)
             elif cls_name == "UserStartedSpeakingFrame":
                 self._mark_user_start()
             elif cls_name == "UserStoppedSpeakingFrame":
@@ -1311,12 +1406,11 @@ class SuperbrynObserver(BaseObserver):
                 self._capture_tool_call_result(frame)
             elif cls_name in _TERMINAL_FRAME_NAMES:
                 self._capture_end_reason(cls_name)
-                # Pipecat 1.3 stopped fanning out `on_pipeline_finished` to
-                # observers — so a terminal frame in the stream is now our
-                # primary signal that the call is over. `_finalize_session`
-                # is idempotent, so older Pipecat versions that also call
-                # `on_pipeline_finished` won't double-send.
-                await self._finalize_session()
+                # Without the task's on_pipeline_finished hook (manual setup), a
+                # terminal frame is the only end signal. With it, finalize waits
+                # for the pipeline to drain so the last reply's played text lands.
+                if not self._finish_hooked:
+                    await self._finalize_session()
 
             if self._extended_capture:
                 self._capture_extended_frame(frame, cls_name, source, source_module)
@@ -1329,6 +1423,19 @@ class SuperbrynObserver(BaseObserver):
             logger.debug("on_push_frame swallowed error: %s", exc)
 
     # ── Capture helpers ──────────────────────────────────────────────────
+
+    def _first_time(self, frame: Any) -> bool:
+        """True on a frame's first push; a bounded window of ids keeps memory flat."""
+        frame_id = getattr(frame, "id", None)
+        if frame_id is None:
+            return True
+        if frame_id in self._seen_ids:
+            return False
+        if len(self._seen_order) >= _DEDUPE_WINDOW:
+            self._seen_ids.discard(self._seen_order.popleft())
+        self._seen_order.append(frame_id)
+        self._seen_ids.add(frame_id)
+        return True
 
     def _now_ms(self) -> int:
         return int(datetime.now(UTC).timestamp() * 1000) - (self._call_start_ms or 0)
@@ -1347,89 +1454,127 @@ class SuperbrynObserver(BaseObserver):
                 "confidence": getattr(frame, "confidence", None),
             }
         )
-        self._last_user_end_ms = now_ms
 
-    def _capture_bot_turn(self, frame: Any) -> None:
-        text = (getattr(frame, "text", "") or "").strip()
-        if not text:
+    def _capture_spoken_text(self, frame: Any) -> None:
+        """Text the bot actually said: arrives with the audio, so a cut-off reply keeps only what was heard."""
+        self._tts_played = True
+        part = _text_part(frame)
+        if part is not None:
+            (self._agent_turn["tts"] if self._agent_turn else self._pending_tts).append(part)
+
+    def _capture_llm_text(self, frame: Any) -> None:
+        """LLM output: the transcript's fallback when no TTS text is played, and where prompt tool calls hide."""
+        text = getattr(frame, "text", None)
+        if not isinstance(text, str) or not text:
+            return
+        part = _text_part(frame)
+        if part is not None:
+            (self._agent_turn["llm"] if self._agent_turn else self._pending_llm).append(part)
+        if self._response_text is not None:
+            self._response_text.append(text)
+
+    def _response_started(self) -> None:
+        if self._agent_turn is None:
+            self._pending_llm = []
+        self._response_text = []
+        self._response_start_ms = self._now_ms()
+
+    def _response_ended(self) -> None:
+        """Lift prompt-engineered ``<tool_use>`` blocks out of the whole response, however it was streamed."""
+        if self._response_text is None:
+            return
+        self._extract_prompt_tool_calls(
+            {"text": "".join(self._response_text), "start_time_ms": self._response_start_ms}
+        )
+        self._response_text = None
+
+    def _bot_started(self) -> None:
+        """One agent turn per stretch of bot audio; its latency runs from the caller's last speech."""
+        if self._agent_turn is not None:
             return
         now_ms = self._now_ms()
-        # Anthropic / OpenAI LLMs stream their response as many
-        # ``LLMTextFrame`` chunks ("Hello", ",", " I'm", " here", ...).
-        # We want one logical bot turn per response, so we append text
-        # into the most recent open agent turn until it's closed by
-        # ``BotStoppedSpeakingFrame`` / ``LLMFullResponseEndFrame``
-        # (handled in ``_close_bot_turn``).
-        for turn in reversed(self.transcript_turns):
-            if turn["speaker"] == "agent" and turn.get("_open"):
-                existing = turn["text"]
-                if existing:
-                    # Join with a space unless the next chunk already
-                    # starts with whitespace or punctuation that wouldn't
-                    # take a leading space.
-                    joiner = "" if text[:1] in (" ", ".", ",", "!", "?", ";", ":") else " "
-                    turn["text"] = f"{existing}{joiner}{text}"
-                else:
-                    turn["text"] = text
-                turn["end_time_ms"] = now_ms
-                return
-            if turn["speaker"] == "agent":
-                # Found a closed agent turn — stop searching, fall
-                # through and open a new one. Stops us from mutating
-                # an older closed turn if the start-frame fired late.
-                break
-        self.transcript_turns.append(
-            {
-                "speaker": "agent",
-                "text": text,
-                "start_time_ms": now_ms,
-                "end_time_ms": now_ms,
-                "latency_ms": (
-                    now_ms - self._last_user_end_ms if self._last_user_end_ms is not None else None
-                ),
-                "_open": True,
-            }
-        )
+        latency = None
+        if self._awaiting_reply and self._speech_end_ms is not None:
+            latency = max(0, now_ms - self._speech_end_ms)
+            self.latencies_ms.append(float(latency))
+            self._awaiting_reply = False
+        turn = {
+            "start_time_ms": now_ms,
+            "end_time_ms": None,
+            "latency_ms": latency,
+            "tts": self._pending_tts,
+            "llm": self._pending_llm,
+            "interrupted": False,
+        }
+        self._pending_tts, self._pending_llm = [], []
+        self._agent_turns.append(turn)
+        self._agent_turn = turn
 
-    def _close_bot_turn(self) -> None:
-        """Mark the most recent open agent turn as closed.
+    def _bot_stopped(self) -> None:
+        if self._agent_turn is not None:
+            self._agent_turn["end_time_ms"] = self._now_ms()
+            self._agent_turn = None
 
-        Called when ``BotStoppedSpeakingFrame`` or
-        ``LLMFullResponseEndFrame`` fires. After this, the next
-        ``LLMTextFrame`` will start a brand-new turn instead of
-        appending to the previous one. Idempotent so the repeated
-        propagation of those frames across pipeline links doesn't
-        accidentally re-close an already-closed turn.
+    def _interrupted(self) -> None:
+        self.interruption_count += 1
+        if self._agent_turn is not None and not self._agent_turn["interrupted"]:
+            self._agent_turn["interrupted"] = True
+            self.bot_turns_interrupted += 1
+        # Text queued for the reply that was cut off is never spoken
+        self._pending_tts, self._pending_llm = [], []
 
-        Before flipping the open flag we run the closed turn through
-        ``_extract_prompt_tool_calls`` so any ``<tool_use>...</tool_use>``
-        blocks the LLM emitted as plain text get lifted onto
-        ``self.tool_calls`` and stripped from the transcript text. We do
-        this here (rather than per-chunk in ``_capture_bot_turn``) so a
-        single XML block streamed across multiple ``LLMTextFrame`` chunks
-        is reassembled into the turn first.
-        """
-        if not self._bot_turn_open:
-            return
-        self._bot_turn_open = False
-        # Release the source lock so the next turn is free to pick either
-        # LLM or TTS as its text source (whichever contributes first).
-        self._current_turn_text_source = None
-        for turn in reversed(self.transcript_turns):
-            if turn["speaker"] == "agent" and turn.get("_open"):
-                self._extract_prompt_tool_calls(turn)
-                turn["_open"] = False
-                return
+    def _caller_silent(self, frame: Any) -> None:
+        """VAD stop: the caller went quiet ``stop_secs`` before this frame; replies are timed from there."""
+        self._vad_seen = True
+        stop_ms = int(_as_seconds(getattr(frame, "stop_secs", 0)) * 1000)
+        stamp = getattr(frame, "timestamp", None)
+        if isinstance(stamp, (int, float)) and stamp > 0 and self._call_start_ms is not None:
+            at_ms = int(stamp * 1000) - self._call_start_ms
+        else:
+            at_ms = self._now_ms()
+        self._speech_end_ms = max(0, at_ms - stop_ms)
+        self._awaiting_reply = True
+
+    def _agent_text(self, turn: dict[str, Any]) -> str:
+        text = _join_parts(turn["tts"])
+        # LLM text only when the call plays no TTS text at all, never for a cut-off turn
+        if not text and not self._tts_played and not turn["interrupted"]:
+            text = _join_parts(turn["llm"])
+        if "<tool_use>" in text:
+            text = _TOOL_USE_PATTERN.sub(" ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _transcript(self) -> list[dict[str, Any]]:
+        """User and agent turns with text, by start time."""
+        end_ms = self._now_ms()
+        turns = [dict(t) for t in self.transcript_turns]
+        for agent in self._agent_turns:
+            text = self._agent_text(agent)
+            if not text:
+                continue
+            turns.append(
+                {
+                    "speaker": "agent",
+                    "text": text,
+                    "start_time_ms": agent["start_time_ms"],
+                    "end_time_ms": agent["end_time_ms"]
+                    if agent["end_time_ms"] is not None
+                    else max(agent["start_time_ms"], end_ms),
+                    "latency_ms": agent["latency_ms"],
+                    "interrupted": agent["interrupted"],
+                }
+            )
+        turns.sort(key=lambda t: t["start_time_ms"])
+        return [t for t in turns if (t.get("text") or "").strip()]
 
     def _extract_prompt_tool_calls(self, turn: dict[str, Any]) -> None:
-        """Lift Anthropic-style prompt tool calls out of a closed agent turn.
+        """Lift Anthropic-style prompt tool calls out of an LLM response.
 
         Searches ``turn["text"]`` for ``<tool_use>{...}</tool_use>`` blocks,
         records each as a structured entry on ``self.tool_calls`` matching
         the existing real-tool record shape (``function_name``,
         ``arguments``, ``result``, ``timestamp_ms``, ``tool_call_id``),
-        and replaces the XML in the turn text with empty so the dashboard
-        transcript reads as natural speech.
+        and replaces the XML in the turn text with empty.
 
         A few intentional design points:
           * ``result`` is ``None`` because nothing actually executed —
@@ -1497,36 +1642,8 @@ class SuperbrynObserver(BaseObserver):
         cleaned = re.sub(r"\s+", " ", "".join(new_text_parts)).strip()
         turn["text"] = cleaned
 
-    def _mark_bot_response_start(self) -> None:
-        # ``BotStartedSpeakingFrame`` / ``LLMFullResponseStartFrame``
-        # propagate to every downstream processor, so ``on_push_frame``
-        # sees them multiple times per actual start. We track an open-
-        # turn flag so each logical bot response gets exactly one
-        # placeholder turn.
-        if self._bot_turn_open:
-            return
-        self._bot_turn_open = True
-        # Defensive reset: normally `_close_bot_turn` clears the source
-        # lock, but if the previous turn was orphaned (e.g. call
-        # cancelled mid-response) we may still be holding the old lock.
-        self._current_turn_text_source = None
-        now_ms = self._now_ms()
-        latency = now_ms - self._last_user_end_ms if self._last_user_end_ms is not None else None
-        if latency is not None and latency >= 0:
-            self.latencies_ms.append(float(latency))
-        self.transcript_turns.append(
-            {
-                "speaker": "agent",
-                "text": "",
-                "start_time_ms": now_ms,
-                "end_time_ms": None,
-                "latency_ms": latency,
-                "_open": True,
-            }
-        )
-
     def _mark_user_start(self) -> None:
-        """Stash the VAD-derived start of a user speech segment.
+        """Stash the start of a user speech segment.
 
         Used as a fallback signal for ``stt_duration_seconds`` when the
         STT service didn't emit ``STTUsageMetricsData`` (e.g. the call
@@ -1534,12 +1651,16 @@ class SuperbrynObserver(BaseObserver):
         start so we can compute a segment length on the matching
         ``UserStoppedSpeakingFrame``.
         """
+        self._awaiting_reply = False
         if self._user_speech_start_ms is None:
             self._user_speech_start_ms = self._now_ms()
 
     def _mark_user_stop(self) -> None:
         now_ms = self._now_ms()
-        self._last_user_end_ms = now_ms
+        # Without VAD frames (STT-side turn detection) the turn's release is the best end-of-speech signal
+        if not self._vad_seen:
+            self._speech_end_ms = now_ms
+            self._awaiting_reply = True
         # If we paired with a UserStartedSpeakingFrame, accumulate the
         # segment length into our VAD-derived total. Only used at
         # payload-build time if STTUsageMetricsData never fired.
@@ -1714,14 +1835,6 @@ class SuperbrynObserver(BaseObserver):
 
             if cls_name in ("ErrorFrame", "FatalErrorFrame"):
                 self._capture_error_frame(frame)
-            elif cls_name == "InterruptionFrame":
-                self.interruption_count += 1
-                if self._bot_speaking:
-                    self.bot_turns_interrupted += 1
-            elif cls_name == "BotStartedSpeakingFrame":
-                self._bot_speaking = True
-            elif cls_name == "BotStoppedSpeakingFrame":
-                self._bot_speaking = False
             elif cls_name == "VADUserStartedSpeakingFrame":
                 self._vad_speech_start_ms = self._now_ms()
                 start_secs = getattr(frame, "start_secs", None)
@@ -2006,24 +2119,12 @@ class SuperbrynObserver(BaseObserver):
             idx = max(0, int(len(sorted_lat) * 0.95) - 1)
             p95_latency = sorted_lat[idx]
 
-        # Belt-and-braces: extract prompt-style `<tool_use>` blocks from any
-        # agent turn that's still flagged open at payload-build time. That
-        # happens when the call ends mid-LLM-response — `_close_bot_turn`
-        # never fires, so the turn would otherwise ship with raw XML in its
-        # text. `_extract_prompt_tool_calls` is idempotent on already-clean
-        # turns, so this is safe to run on every agent turn.
-        for t in self.transcript_turns:
-            if t.get("speaker") == "agent" and t.get("_open"):
-                self._extract_prompt_tool_calls(t)
+        # A call that ends mid-response still gets its prompt tool calls lifted
+        self._response_ended()
 
-        # Drop empty turns — matches livekit-evals' filter. Also strip
-        # the internal ``_open`` marker (used by the streaming-LLM bot
-        # turn accumulator) so it doesn't leak into the wire format.
-        turns_with_text = [
-            {k: v for k, v in t.items() if k != "_open"}
-            for t in self.transcript_turns
-            if t.get("text", "").strip()
-        ]
+        # Agent turns are built here from what was played; empty turns are
+        # dropped (matches livekit-evals' filter).
+        turns_with_text = self._transcript()
 
         # Wire-format `mode` defaults to "observe" (production) so older
         # callers and the manual/advanced flow keep their existing
@@ -2473,16 +2574,3 @@ class SuperbrynObserver(BaseObserver):
             logger.error("SUPERBRYN_PIPECAT_HTTP_%d: %s", resp.status, body[:200])
 
     # ── Helpers ──────────────────────────────────────────────────────────
-
-    def _looks_like_bot_text(self, frame: Any) -> bool:
-        """
-        A `TextFrame` can come from many places. We treat it as a bot turn
-        only if it appears between LLM-response-start and the next user
-        transcription — i.e. there's an open bot turn waiting for text.
-
-        We gate on `_bot_turn_open` rather than checking for an empty-text
-        agent turn. The old empty-text check fired False after the very first
-        streaming token was appended, silently dropping every subsequent
-        `LLMTextFrame` chunk for that turn.
-        """
-        return self._bot_turn_open

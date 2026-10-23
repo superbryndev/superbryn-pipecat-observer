@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superbryn-pipecat-observer"
-version = "0.10.1"
+version = "0.11.0"
 description = "Track and evaluate Pipecat agent sessions with automatic metrics, transcripts, and usage analytics"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,6 +46,12 @@ Homepage = "https://github.com/superbryndev/superbryn-pipecat-observer"
 Documentation = "https://docs.superbryn.com/monitor/integrations#pipecat-sdk"
 Repository = "https://github.com/superbryndev/superbryn-pipecat-observer"
 Issues = "https://github.com/superbryndev/superbryn-pipecat-observer/issues"
+
+[tool.uv]
+# Dev lock only (not in the published package): pipecat-ai caps Pillow below 13,
+# which leaves the lock on a Pillow with open security advisories. Nothing here
+# uses Pillow; tests and the pipeline check pass on 13.
+override-dependencies = ["pillow>=13.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]

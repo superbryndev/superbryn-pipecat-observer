@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -71,6 +71,10 @@ jobs:
       - name: Build package
         if: steps.pypi.outputs.publish == 'true'
         run: python -m build
+
+      - name: Package ships no examples or pipeline check
+        if: steps.pypi.outputs.publish == 'true'
+        run: python .github/scripts/check_dist_contents.py dist
 
       - name: Publish to PyPI
         if: steps.pypi.outputs.publish == 'true'
