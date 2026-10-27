@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -1119,6 +1120,59 @@ async def test_smart_turn_timeout_counts_in_endpointing(clock, http, waits, leas
         "min_end_of_turn_ms": least,
         "max_end_of_turn_ms": 1200,
     }
+
+
+def tone(seconds: float = 0.02, rate: int = 16000) -> InputAudioRawFrame:
+    """The caller talking: a 440 Hz tone, about -23 dBFS."""
+    t = np.arange(int(rate * seconds)) / rate
+    pcm = (3000 * np.sin(2 * np.pi * 440 * t)).astype("<i2").tobytes()
+    return InputAudioRawFrame(audio=pcm, sample_rate=rate, num_channels=1)
+
+
+async def caller_audio(call: Call, *, start: float, speech: float, silence: float) -> None:
+    """The caller's line in 20 ms frames: quiet, `speech` seconds of tone from `start`, then `silence`."""
+    loud = [False] * 10 + [True] * round(speech / 0.02) + [False] * round(silence / 0.02)
+    for i, is_loud in enumerate(loud):
+        await call.push(tone() if is_loud else audio(0.02), at=start + (i - 9) * 0.02)
+
+
+async def test_speech_to_speech_turn_latency_from_the_callers_audio(clock, http):
+    """No VAD frames: the caller's audio times the wait; the service's turn release, the endpointing."""
+    llm, out = llm_service(model="gpt-realtime"), FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await caller_audio(call, start=1.0, speech=1.2, silence=0.3)  # speech ends at 2.2
+    await call.push(UserStoppedSpeakingFrame(), at=2.9, source=llm)  # the server's release
+    await call.push(BotStartedSpeakingFrame(), at=3.0, source=out)
+    await call.push(tts_text("It shipped yesterday."), at=3.1, source=out)
+    await call.push(BotStoppedSpeakingFrame(), at=4.0, source=out)
+    await call.end(at=5)
+    assert ended(http)["diagnostics"]["turn_latencies"] == [
+        {"turnLatency": 800, "endpointingLatency": 700, "turn_id": "a1"}
+    ]
+
+
+async def test_reply_inside_the_audio_hangover_gets_a_turn_latency(clock, http):
+    """A model that answers before the detector's hangover ends (Nova Sonic and Gemini Live send no turn frames)."""
+    out = FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await caller_audio(call, start=1.0, speech=0.6, silence=0.1)  # ends at 1.6, quiet to 1.7
+    await call.push(BotStartedSpeakingFrame(), at=1.75, source=out)
+    await call.push(tts_text("Sure."), at=1.8, source=out)
+    await call.push(BotStoppedSpeakingFrame(), at=2.5, source=out)
+    await call.end(at=3)
+    assert ended(http)["diagnostics"]["turn_latencies"] == [{"turnLatency": 150, "turn_id": "a1"}]
+
+
+async def test_vad_times_the_turn_when_both_vad_and_audio_are_seen(clock, http):
+    out = FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(vad_start(1.2), at=1.2)
+    await caller_audio(call, start=1.2, speech=1.0, silence=0.5)  # tone to 2.2
+    await call.push(vad_stop(3.0, stop_secs=0.5), at=3.0)
+    await agent_turn(call, "Sure.", start=3.2, stop=4.0, out=out)
+    await call.end(at=5)
+    [entry] = ended(http)["diagnostics"]["turn_latencies"]
+    assert entry["turnLatency"] == 700  # from VAD's stop (3.0 - 0.5), not the audio's end
 
 
 # ── configuration, tools, pipeline, usage ────────────────────────────────

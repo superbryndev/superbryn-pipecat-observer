@@ -34,6 +34,10 @@ def detect_provider_from_model(model_name: str | None) -> str:
     if "perplexity" in s or "pplx" in s:
         return "perplexity"
 
+    # ── AWS: Bedrock ids ("amazon.nova-2-sonic-v1:0") and Nova Sonic, before "sonic" / "nova" below
+    if any(x in s for x in ("amazon", "bedrock", "polly")) or ("nova" in s and "sonic" in s):
+        return "aws"
+
     # ── TTS ─────────────────────────────────────────────────────────────────
     if any(x in s for x in ("eleven", "elevenlabs")):
         return "elevenlabs"
@@ -47,8 +51,6 @@ def detect_provider_from_model(model_name: str | None) -> str:
         return "sarvam"
     if "azure" in s:
         return "azure"
-    if any(x in s for x in ("polly", "amazon")):
-        return "aws"
 
     # ── STT ─────────────────────────────────────────────────────────────────
     if any(x in s for x in ("deepgram", "nova", "aura")):
