@@ -18,6 +18,8 @@ from urllib.parse import parse_qsl
 
 import aiohttp
 
+from ._caller_speech import CallerSpeech
+
 try:
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -451,6 +453,8 @@ class _Capture:
         # audio delivered to a streaming STT, for Pipecat versions that report no STT usage
         self._stt_audio_s = 0.0
         self._stt_segmented = False
+        # the caller's speech from their audio, when no VAD frames time it
+        self._speech = CallerSpeech()
 
     def on_frame(self, data: FramePushed) -> None:
         """Record a push: errors either way, TTS text when played, the rest on its first hop."""
@@ -477,6 +481,8 @@ class _Capture:
         if isinstance(frame, InputAudioRawFrame):
             if isinstance(data.destination, STTService):
                 self._stt_audio(data.destination, frame)
+            if not self._vad_seen:
+                self._caller_audio(frame, self._time(data))
             return
         if isinstance(frame, TTSTextFrame):
             if not isinstance(source, BaseOutputTransport):
@@ -619,6 +625,14 @@ class _Capture:
         self._cycle = {"silence_at": silence_at, "stop_secs": stop_secs}
         self._late_stt = None
 
+    def _caller_audio(self, frame: Any, t: float) -> None:
+        """No VAD frames (speech-to-speech services send none): the caller's audio times when they went quiet."""
+        event = self._speech.feed(frame, t)
+        if event == "start":
+            self._cycle = None  # talking again before the reply, as at a VAD start
+        elif event == "stop":
+            self._cycle = {"silence_at": self._speech.end, "stop_secs": 0.0}
+
     def _new_user_turn(self, start: float, *, vad: bool) -> dict[str, Any] | None:
         if len(self._user_turns) >= _MAX_TURNS:
             return None
@@ -646,6 +660,9 @@ class _Capture:
     def _bot_started(self, t: float) -> None:
         if self._agent is not None:
             return
+        # a caller who went quiet within the audio detector's hangover has finished
+        if self._cycle is None and not self._vad_seen and (end := self._speech.pause()) is not None:
+            self._cycle = {"silence_at": end, "stop_secs": 0.0}
         turn = {
             "id": f"a{len(self._agent_turns) + 1}",
             "start": t,

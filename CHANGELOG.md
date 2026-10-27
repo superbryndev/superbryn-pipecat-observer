@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-27
+
+Found by end-to-end calls with real services (Gemini Live, Nova Sonic, and a Deepgram + Gemini + Deepgram cascade), each reply latency checked against how long the scripted caller actually waited.
+
+### Fixed
+- **Observer: a reply's latency was lost when the caller paused mid-line.** The turn-start frame Pipecat sends after such a pause cleared the pending reply. When VAD or the caller's audio times the caller, that frame no longer does. On a live call with a 450 ms pause the reply read 3511 ms against the caller's 3545 ms wait.
+- **Observer: caller turns split into 0 ms pieces.** A caller turn is one turn from when the caller starts to when they stop: its final transcripts join until the agent speaks. It is timed by VAD (start minus `start_secs`, stop minus `stop_secs`), else by the caller's own audio, and no longer stamped when each transcript arrives.
+- **Observer and eval mode: no reply latency for speech-to-speech services.** Gemini Live and Nova Sonic send no VAD frames, so nothing timed the caller. The caller's own input audio now does (an energy detector: speech is 4× the line's noise and above about −46 dBFS). On live calls each reply's latency was within 20 ms of the caller's wait.
+- **Observer: `stt_duration_seconds` with no STT service.** Speech-to-speech calls reported up to 9.7 s, estimated from audio that no STT received; it is 0 when the pipeline has no STT service.
+- **Nova Sonic labelled `cartesia`.** AWS ids (`amazon.*`, Bedrock, Nova Sonic) are checked before the "sonic" (Cartesia) and "nova" (Deepgram) names, so it reads `aws`.
+- Final transcripts join with one space.
+
 ## [0.11.0] - 2026-10-23
 
 Found by running a scripted call through a real Pipecat 1.6 pipeline (`examples/pipeline_check/`) and checked against production payloads.

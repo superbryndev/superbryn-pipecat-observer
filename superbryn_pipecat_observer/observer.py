@@ -34,6 +34,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ._caller_speech import CallerSpeech
 from ._provider_detect import detect_provider_from_model
 from .audio_recorder import SuperbrynAudioRecorder
 from .config import AGENT_CONFIG, WEBHOOK_CONFIG
@@ -53,7 +54,7 @@ except Exception:  # pragma: no cover - older pipecat: parts are joined with spa
 
 logger = logging.getLogger("superbryn_pipecat_observer")
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 _SDK_TAG = f"@superbryn/pipecat-observer@{__version__}"
 
 # Frame class names that signal the call/pipeline is wrapping up. Pipecat 1.3
@@ -92,6 +93,9 @@ _LLM_TEXT_FRAME_NAMES = (
 # multiple `<tool_use>` blocks parses as multiple calls instead of one
 # spanning the entire turn. DOTALL lets the inner JSON span newlines.
 _TOOL_USE_PATTERN = re.compile(r"<tool_use>\s*(\{.*?\})\s*</tool_use>", re.DOTALL)
+
+# The caller's audio as input transports push it (Daily and LiveKit send the subclass)
+_INPUT_AUDIO_FRAME_NAMES = ("InputAudioRawFrame", "UserAudioRawFrame")
 
 # Frames handled on an upstream push too: errors travel upstream, and
 # speech-to-speech services push the caller's transcript upstream.
@@ -173,12 +177,23 @@ def _is_output_transport(processor: Any) -> bool:
     return any(cls.__name__ == "BaseOutputTransport" for cls in type(processor).__mro__)
 
 
-def _text_part(frame: Any) -> Any:
-    """A text frame as a joinable part; keeps whether its text already carries spacing."""
+def _is_stt_service(processor: Any) -> bool:
+    if processor is None:
+        return False
+    return any(cls.__name__ == "STTService" for cls in type(processor).__mro__)
+
+
+def _text_part(frame: Any, *, final: bool = False) -> Any:
+    """A text frame as a joinable part; keeps whether its text already carries spacing.
+
+    A final transcript that carries none is trimmed, so joined finals get one space.
+    """
     text = getattr(frame, "text", None)
+    spaced = bool(getattr(frame, "includes_inter_frame_spaces", False))
+    if final and isinstance(text, str) and not spaced:
+        text = text.strip()
     if not isinstance(text, str) or not text:
         return None
-    spaced = bool(getattr(frame, "includes_inter_frame_spaces", False))
     if TextPartForConcatenation is None:
         return (text, spaced)
     return TextPartForConcatenation(text, spaced)
@@ -380,8 +395,13 @@ class SuperbrynObserver(BaseObserver):
         self.ended_at: datetime | None = None
         self._call_start_ms: int | None = None
 
-        # User turns, one per final transcription
+        # User turns, one per caller turn: its finals join until the agent speaks.
+        # Timed by VAD, else the caller's audio, else the service's turn frames;
+        # with none of those, a turn runs from its first final's arrival.
         self.transcript_turns: list[dict[str, Any]] = []
+        self._user_sealed = False  # the agent spoke since the latest user turn opened
+        self._caller_timed = False
+        self._speech = CallerSpeech()
 
         # VAD-derived fallback for `stt_duration_seconds`. We track the
         # start of every user-speaking segment and accumulate total
@@ -390,6 +410,8 @@ class SuperbrynObserver(BaseObserver):
         # has metrics disabled, or the call ended before a flush).
         self._user_speech_start_ms: int | None = None
         self._vad_user_speech_ms: int = 0
+        # Set when an STT service transcribes; speech-to-speech pipelines have none
+        self._has_stt = False
 
         # Agent turns: one per stretch of bot audio (BotStarted → BotStopped).
         # Text is what the output transport played (TTSTextFrame); LLM text
@@ -1376,6 +1398,7 @@ class SuperbrynObserver(BaseObserver):
                 return
 
             if cls_name == "TranscriptionFrame":
+                self._has_stt = self._has_stt or _is_stt_service(source)
                 self._capture_user_turn(frame)
             elif cls_name in _LLM_TEXT_FRAME_NAMES:
                 if "pipecat.services." in source_module:
@@ -1393,13 +1416,15 @@ class SuperbrynObserver(BaseObserver):
             elif cls_name == "MetricsFrame":
                 self._capture_metrics(frame)
             elif cls_name == "VADUserStartedSpeakingFrame":
-                self._awaiting_reply = False
+                self._caller_speaking(frame)
             elif cls_name == "VADUserStoppedSpeakingFrame":
                 self._caller_silent(frame)
             elif cls_name == "UserStartedSpeakingFrame":
                 self._mark_user_start()
             elif cls_name == "UserStoppedSpeakingFrame":
                 self._mark_user_stop()
+            elif cls_name in _INPUT_AUDIO_FRAME_NAMES:
+                self._caller_audio(frame)
             elif cls_name == "FunctionCallInProgressFrame":
                 self._capture_tool_call_start(frame)
             elif cls_name == "FunctionCallResultFrame":
@@ -1441,19 +1466,61 @@ class SuperbrynObserver(BaseObserver):
         return int(datetime.now(UTC).timestamp() * 1000) - (self._call_start_ms or 0)
 
     def _capture_user_turn(self, frame: Any) -> None:
-        text = (getattr(frame, "text", "") or "").strip()
-        if not text:
+        """A final joins the caller's turn; untimed, finals until the agent speaks make one turn."""
+        part = _text_part(frame, final=True)
+        if part is None or not frame.text.strip():
             return
         now_ms = self._now_ms()
+        if not self.transcript_turns or (self._user_sealed and not self._caller_timed):
+            self._open_user_turn(now_ms)
+        # Timed, a final that lands after the agent started still joins the caller's turn before it
+        turn = self.transcript_turns[-1]
+        turn["_parts"].append(part)
+        turn["text"] = _join_parts(turn["_parts"]).strip()
+        if turn["confidence"] is None:
+            turn["confidence"] = getattr(frame, "confidence", None)
+        if not self._caller_timed:
+            turn["end_time_ms"] = now_ms
+
+    def _open_user_turn(self, at_ms: int) -> None:
         self.transcript_turns.append(
             {
                 "speaker": "user",
-                "text": text,
-                "start_time_ms": now_ms,
-                "end_time_ms": now_ms,
-                "confidence": getattr(frame, "confidence", None),
+                "text": "",
+                "start_time_ms": at_ms,
+                "end_time_ms": None,
+                "confidence": None,
+                "_parts": [],
             }
         )
+        self._user_sealed = False
+
+    def _caller_started(self, at_ms: int) -> None:
+        """The caller started talking: no reply is pending, and a turn opens unless the last one is unanswered."""
+        self._caller_timed = True
+        self._awaiting_reply = False
+        if self.transcript_turns and not self._user_sealed:
+            last = self.transcript_turns[-1]
+            last["start_time_ms"] = min(last["start_time_ms"], at_ms)
+        else:
+            self._open_user_turn(at_ms)
+
+    def _caller_stopped(self, at_ms: int) -> None:
+        """The caller went quiet: their turn ends there, and the reply is timed from it."""
+        if self.transcript_turns:
+            self.transcript_turns[-1]["end_time_ms"] = at_ms
+        self._speech_end_ms = at_ms
+        self._awaiting_reply = True
+
+    def _caller_audio(self, frame: Any) -> None:
+        """No VAD frames (speech-to-speech services send none): the caller's own audio times their speech."""
+        if self._vad_seen:
+            return
+        event = self._speech.feed(frame, self._now_ms() / 1000)
+        if event == "start":
+            self._caller_started(round(self._speech.start * 1000))
+        elif event == "stop":
+            self._caller_stopped(round(self._speech.end * 1000))
 
     def _capture_spoken_text(self, frame: Any) -> None:
         """Text the bot actually said: arrives with the audio, so a cut-off reply keeps only what was heard."""
@@ -1493,6 +1560,10 @@ class SuperbrynObserver(BaseObserver):
         if self._agent_turn is not None:
             return
         now_ms = self._now_ms()
+        # A caller who went quiet within the detector's hangover has finished
+        if not self._vad_seen and (end := self._speech.pause()) is not None:
+            self._caller_stopped(round(end * 1000))
+        self._user_sealed = True
         latency = None
         if self._awaiting_reply and self._speech_end_ms is not None:
             latency = max(0, now_ms - self._speech_end_ms)
@@ -1523,17 +1594,24 @@ class SuperbrynObserver(BaseObserver):
         # Text queued for the reply that was cut off is never spoken
         self._pending_tts, self._pending_llm = [], []
 
+    def _caller_speaking(self, frame: Any) -> None:
+        """VAD start: the caller began ``start_secs`` before this frame."""
+        self._vad_seen = True
+        start_ms = int(_as_seconds(getattr(frame, "start_secs", 0)) * 1000)
+        self._caller_started(max(0, self._vad_at_ms(frame) - start_ms))
+
     def _caller_silent(self, frame: Any) -> None:
         """VAD stop: the caller went quiet ``stop_secs`` before this frame; replies are timed from there."""
         self._vad_seen = True
         stop_ms = int(_as_seconds(getattr(frame, "stop_secs", 0)) * 1000)
+        self._caller_stopped(max(0, self._vad_at_ms(frame) - stop_ms))
+
+    def _vad_at_ms(self, frame: Any) -> int:
+        """When VAD made the frame (its own timestamp), on the call's clock."""
         stamp = getattr(frame, "timestamp", None)
         if isinstance(stamp, (int, float)) and stamp > 0 and self._call_start_ms is not None:
-            at_ms = int(stamp * 1000) - self._call_start_ms
-        else:
-            at_ms = self._now_ms()
-        self._speech_end_ms = max(0, at_ms - stop_ms)
-        self._awaiting_reply = True
+            return int(stamp * 1000) - self._call_start_ms
+        return self._now_ms()
 
     def _agent_text(self, turn: dict[str, Any]) -> str:
         text = _join_parts(turn["tts"])
@@ -1547,7 +1625,12 @@ class SuperbrynObserver(BaseObserver):
     def _transcript(self) -> list[dict[str, Any]]:
         """User and agent turns with text, by start time."""
         end_ms = self._now_ms()
-        turns = [dict(t) for t in self.transcript_turns]
+        turns = []
+        for user in self.transcript_turns:
+            turn = {k: v for k, v in user.items() if not k.startswith("_")}
+            if turn["end_time_ms"] is None:  # still talking when the call ended
+                turn["end_time_ms"] = max(turn["start_time_ms"], end_ms)
+            turns.append(turn)
         for agent in self._agent_turns:
             text = self._agent_text(agent)
             if not text:
@@ -1651,16 +1734,18 @@ class SuperbrynObserver(BaseObserver):
         start so we can compute a segment length on the matching
         ``UserStoppedSpeakingFrame``.
         """
-        self._awaiting_reply = False
+        now_ms = self._now_ms()
+        # VAD or the caller's audio times the caller when present: this later turn start must not cancel the reply
+        if not self._vad_seen and not self._speech.heard:
+            self._caller_started(now_ms)
         if self._user_speech_start_ms is None:
-            self._user_speech_start_ms = self._now_ms()
+            self._user_speech_start_ms = now_ms
 
     def _mark_user_stop(self) -> None:
         now_ms = self._now_ms()
-        # Without VAD frames (STT-side turn detection) the turn's release is the best end-of-speech signal
-        if not self._vad_seen:
-            self._speech_end_ms = now_ms
-            self._awaiting_reply = True
+        # Without VAD frames or caller audio (STT-side turn detection) the turn's release is the best signal
+        if not self._vad_seen and not self._speech.heard:
+            self._caller_stopped(now_ms)
         # If we paired with a UserStartedSpeakingFrame, accumulate the
         # segment length into our VAD-derived total. Only used at
         # payload-build time if STTUsageMetricsData never fired.
@@ -2175,9 +2260,10 @@ class SuperbrynObserver(BaseObserver):
                 # provider reports them; otherwise fall back to the
                 # VAD-derived total so the dashboard still has a
                 # reasonable speech-duration figure on aborted calls.
+                # A pipeline without an STT service (speech-to-speech) has none.
                 "stt_duration_seconds": (
                     self.usage["stt_duration_seconds"]
-                    if self.usage["stt_duration_seconds"] > 0
+                    if self.usage["stt_duration_seconds"] > 0 or not self._has_stt
                     else round(self._vad_user_speech_ms / 1000.0, 3)
                 ),
                 "tts_characters": self.usage["tts_characters"],
@@ -2306,8 +2392,8 @@ class SuperbrynObserver(BaseObserver):
         for (_, prev_end), (next_start, _) in zip(timed, timed[1:], strict=False):
             longest_gap_ms = max(longest_gap_ms, next_start - prev_end)
 
-        # Pipecat gives user turns a single STT timestamp (start == end), so
-        # user talk time comes from VAD segments when we observed them.
+        # A user turn spans the caller's pauses, so user talk time comes
+        # from VAD segments when we observed them.
         vad_user_seconds = sum(s["duration_ms"] for s in self.vad_segments) / 1000.0
         if vad_user_seconds > 0:
             user_seconds = vad_user_seconds
