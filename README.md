@@ -1,177 +1,168 @@
 # SuperBryn Pipecat Observer
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.11.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.12.0-orange)](https://pypi.org/project/superbryn-pipecat-observer/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pipecat](https://img.shields.io/badge/pipecat-compatible-purple.svg)](https://github.com/pipecat-ai/pipecat)
 
-Drop-in observer for [Pipecat](https://github.com/pipecat-ai/pipecat) voice AI agents. Captures transcript, audio, usage, and latency, then ships everything to SuperBryn at end of session — on any transport (Daily, Twilio, Plivo, Vobiz, WebRTC, WebSocket, …).
+**One call in your Pipecat bot reports every call to SuperBryn.**
 
-## Features
+`attach(task, runner_args)` sends your agent's own record of each call: the transcript, tool calls, each reply's
+latency parts, the models and settings that ran, token, audio and character usage, every LLM request and what became
+of it, and every STT, LLM, TTS or transport failure. SuperBryn does every calculation on its side. It works on any
+transport Pipecat speaks (Daily, Twilio, Plivo, Vobiz, Exotel, WebRTC, WebSocket) with no carrier credentials.
 
-- **Drop-in integration** — wrap your pipeline with one call, every call shows up in SuperBryn.
-- **Transport-agnostic** — same code works on Daily, Twilio, Plivo, Vobiz, WebRTC, and FastAPI WebSocket. No carrier credentials needed.
-- **Precise transcripts** — speaker turns with timestamps, confidence scores, and per-turn bot latency.
-- **Usage metrics** — LLM tokens (in / out), STT seconds, TTS characters, captured automatically from Pipecat's `MetricsFrame`.
-- **Latency tracking** — average and p95 response time from the caller's end of speech to the bot's first audio.
-- **Provider auto-detection** — LLM / STT / TTS provider, model, and voice ID inferred from the service modules in your pipeline.
-- **Tool-call capture** — both real Pipecat tools (`FunctionCallInProgressFrame` / `FunctionCallResultFrame`) and Anthropic-style `<tool_use>` prompt tools.
-- **UAT / simulation mode** — `simulate_and_create_task` suppresses billing for non-production runs.
-- **Session log capture** — buffer INFO+ logs (`logging` and loguru) from the call window and attach them to the payload.
-- **Custom metadata** — attach any key/value bag to the call record; mutable mid-session.
-- **Turn-detection latency** — end-to-end turn-completion timing and confidence, the hidden part of response latency.
-- **Per-service timings** — real TTFB / TTFA (with silence padding split out) / processing time, broken down by service.
-- **Pipeline diagnostics** — error frames, interruptions, VAD segments, DTMF, transport lifecycle, frame histogram.
-- **Fail-open** — if anything in telemetry fails, your pipeline keeps running. Telemetry never crashes a call.
-- **Frame-version tolerant** — frames are matched by class name, so a Pipecat upgrade doesn't hard-break the observer.
+- **SuperBryn test calls** are reported for testing (surface `testing`): the agent's record sits next to the test.
+- **Every other call** is a production call (surface `observability`): it is recorded in stereo and appears in
+  Monitor. `production=False` turns production reporting off.
 
-## Prerequisites
-
-- Python **3.11+**
-- An active Pipecat pipeline (`pipecat-ai >= 0.0.50` recommended for the 1.3+ observer lifecycle)
-- `aiohttp >= 3.9.0` (installed as a transitive dependency)
-- A SuperBryn API key from [https://app.superbryn.com/api-keys](https://app.superbryn.com/api-keys)
+Each call is reported once, as `call.started` when the pipeline starts and `call.ended` when it finishes. Everything
+runs in the background: it adds no latency and never raises into your pipeline.
 
 ## Install
 
 ```bash
-pip install superbryn-pipecat-observer
+pip install -U "superbryn-pipecat-observer>=0.12.0"
 ```
 
-## Quick Start
+## Setup
 
-1. Set your API key in the agent process environment:
+```bash
+export SUPERBRYN_API_KEY=sbryn_...                               # one key with test_data:write and obs:write
+export SUPERBRYN_AGENT_ID=3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b  # the agent's SuperBryn ID (not needed with an agent key)
+```
 
-   ```bash
-   export SUPERBRYN_API_KEY="sb_..."
-   ```
-
-2. Wrap your pipeline with the observer:
-
-   ```python
-   from pipecat.pipeline.runner import PipelineRunner
-   from superbryn_pipecat_observer import SuperbrynObserver
-
-   observer = SuperbrynObserver(
-       agent_id="your-agent-id",
-       agent_name="support-bot",
-   )
-
-   task = observer.monitor_and_create_task(
-       pipeline,
-       transport=transport,
-   )
-
-   await PipelineRunner().run(task)
-   ```
-
-3. Run a call. The session shows up in SuperBryn within seconds of the call ending.
-
-That's it. The same code works on every transport — no carrier credentials, no per-carrier wiring.
-
-For UAT / simulation calls that shouldn't be billed or analyzed, use `simulate_and_create_task` instead — same signature.
-
-> **Note:** earlier releases exposed these as `observe_and_create_task` /
-> `track_and_create_task`. Those names still work but emit a
-> `DeprecationWarning` and will be removed in `0.8.0`.
-
-## What Gets Tracked
-
-### Transcript
-- Speaker turns (`user` / `agent`)
-- Per-turn `start_time_ms` / `end_time_ms` (relative to call start)
-- Per-turn `confidence` (when the STT provider reports it)
-- Per-bot-turn `latency_ms` (caller's end of speech → bot audio start)
-- One agent turn per stretch of bot audio; its text is what was played (TTS text), so a reply the caller cut off keeps only the words heard and carries `interrupted: true`
-- Pipelines that play no TTS text fall back to the LLM's streamed text
-- Empty turns are filtered out before send
-
-### Usage Metrics
-Captured from Pipecat's `MetricsFrame`. Pipecat sends them only with `enable_usage_metrics=True` (and service timings with `enable_metrics=True`); the observer switches both on, including on your own `PipelineParams`, unless you set one to `False`:
-- **LLM** — input tokens, output tokens, model, provider
-- **TTS** — character count, model, provider, voice ID
-- **STT** — seconds of audio processed, model, provider (with a VAD-derived fallback when the provider doesn't report)
-
-### Latency
-- Per-turn response delay (caller's end of speech → bot audio start)
-- Aggregated **average** and **p95** across the call
-
-### Session Metadata
-- Agent ID, agent name, transport label (e.g. `daily`, `twilio`, `vobiz`)
-- LLM / STT / TTS provider, model, voice ID
-- Pipeline / SDK version tag
-- Optional `from_number`, `to_number`, `recording_url`
-- `mode` (`observe` or `track`)
-- Any `custom_metadata` you pass in (mutable mid-session via `observer.set_custom_metadata({...})`)
-- Call end reason (`completed` / `cancelled`)
-
-### Tool Calls
-- Real Pipecat tools — paired from `FunctionCallInProgressFrame` + `FunctionCallResultFrame` by `tool_call_id`
-- Anthropic-style prompt tool calls — `<tool_use>{...}</tool_use>` blocks extracted from each LLM response and lifted onto `call.tool_calls` (XML is stripped from the visible transcript)
-- One record per tool call, however many processors the frames pass through
-- Each record carries `function_name`, `arguments`, `result`, `timestamp_ms`, and `tool_call_id`
-
-### Session Logs (opt-in)
-- INFO+ records from the agent process during the call window, from both `logging` and loguru (which Pipecat uses)
-- Bounded by `max_log_records` (default 1000) so a chatty agent can't blow up the payload
-- Disable with `capture_logs=False`
-
-### Extended Telemetry (on by default)
-
-Everything below ships as **additive** sections on the same payload — all previously
-existing fields are unchanged. Pass `extended_capture=False` for the legacy shape.
-Frames are matched by class name, so an older or newer Pipecat produces fewer
-fields rather than breaking.
-
-| Section | What's inside |
-|---------|---------------|
-| `call.turn_detection` | Turn-completion predictions (`TurnMetricsData`): avg/max end-to-end processing ms, prediction count, confidence, incomplete predictions |
-| `call.latency` (new keys) | Real per-service timings: `avg/p95_ttfb_ms`, `avg_ttfa_ms` + `avg_tts_leading_silence_ms`, `avg_processing_ms`, `avg_text_aggregation_ms`, `avg_turn_detection_ms`, `by_service` breakdown |
-| `call.usage` (new keys) | Full token breakdown: total, cache read/creation, reasoning, input/output audio tokens |
-| `call.speech_stats` | Talk seconds per side, turn counts, talk ratio, silence, longest gap, response delays |
-| `call.interruptions` | Interruption count, interruptions while the bot was speaking, user idle timeouts |
-| `call.errors` | `ErrorFrame` / `FatalErrorFrame` — message, `fatal`, processor, exception type |
-| `call.connection` | Transport lifecycle timeline (client connected, bot connected, output ready, disconnect) |
-| `call.sip` | `{attributes, dtmf}` — DTMF keypresses with timestamps and direction |
-| `call.vad` | Speech segments, total speech seconds, average segment length, VAD `start_secs`/`stop_secs` |
-| `call.pipeline` | Services seen, service metadata (`ttfs_p99_ms`, `is_realtime_service`), frame-type histogram, LLM reasoning counts |
-| `call.environment` | Observer / Pipecat / Python versions |
+Add one call to your bot, once per call, after building the `PipelineTask` and **before** it runs:
 
 ```python
-observer = SuperbrynObserver(
-    agent_id=AGENT_ID,
-    api_key=os.getenv("SUPERBRYN_API_KEY"),
-    extended_capture=False,  # legacy payload shape only
-)
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from superbryn_pipecat_observer import attach
+
+
+async def bot(runner_args):
+    ...
+    task = PipelineTask(pipeline, params=PipelineParams())
+    report = attach(task, runner_args)
+    await PipelineRunner().run(task)
 ```
 
-> **Note:** unlike the LiveKit SDK, a Pipecat observer has no access to
-> transport-level WebRTC statistics, so there is no jitter / RTT / packet-loss
-> data. `call.connection` captures the transport lifecycle events that *are*
-> observable. LLM reasoning is reported as a count and character total only —
-> the reasoning text itself is never transmitted.
+That's all: `attach` adds its own observer, its own `on_pipeline_finished` hook and, for production calls, the
+recorder. Pass `runner_args` (what Pipecat's runner hands your bot) so test calls are recognised and the call is
+named as before; a bot with no runner arguments passes what it knows as keywords instead (below).
 
-## Prompt Sync
+### Options
 
-Keeps SuperBryn in step with the prompt your agent runs. Pass the prompt template (placeholders unfilled) to the observer:
+| Option | Environment variable | What it does |
+|--------|----------------------|--------------|
+| `api_key` | `SUPERBRYN_API_KEY` | A SuperBryn API key: test calls need `test_data:write` and prompt versions `obs:write`; production calls take any valid key (the setup screens' keys hold both). Without one nothing is sent. |
+| `agent_id` | `SUPERBRYN_AGENT_ID` | The agent's SuperBryn ID, a UUID. Test calls need it unless the key is the agent's own key. Any other value is left out, with one warning. |
+| `production` | | `True` by default. `False` reports SuperBryn test calls only: production calls send nothing and are not recorded. |
+| `record` | | `True` by default. `False` reports production calls without SuperBryn's recording (for example for compliance). |
+| `simulation` | | `False` by default. `True` marks production calls as your own UAT / simulation runs (`observability.mode: "track"`): SuperBryn keeps their transcript without analysis or billing, and they are not recorded and name no prompt. |
+| `capture_logs` | | `True` by default: a production call carries the INFO+ log lines its own code wrote (loguru, and `logging` at the levels your config lets through), up to 1000, each cut to 2,000 characters. Other calls in the same process are left out (call `attach()` in the task that runs the pipeline), and your logging config is not changed. `False` sends none. |
+| `custom_data` | | Your own keys for this call, a dict sent as given (see below). |
+| `prompt`, `prompt_version` | | The prompt template your agent runs, and your label for this version (see Prompt sync). |
+| `base_url` | `SUPERBRYN_BASE_URL` | The SuperBryn API origin, `https://api.superbryn.com` by default. |
+| `superbryn_call_id`, `from_number`, `to_number`, `call_id`, `call_data` | | What your bot already knows about the call, when `runner_args` doesn't carry it: SuperBryn's test ID, the caller and the dialled number, your own ID for the call, and a parsed telephony handshake (`parse_telephony_websocket`). |
+| | `SUPERBRYN_OBSERVER_ENABLED` | `false`, `0`, `no` or `off` turns `attach` off for the whole process, as in 0.11. |
+
+`SUPERBRYN_TEST_API_KEY`, `SUPERBRYN_WEBHOOK_URL`, `WEBHOOK_URL`, `AGENT_ID` and `VERSION_ID`, which 0.11 read, are
+not read any more.
+
+### The handle
+
+`attach` returns the call's handle. Use it for anything known only during the call, until the call ends:
 
 ```python
-observer = SuperbrynObserver(
-    agent_name="my-pipecat-bot",
-    prompt=SYSTEM_PROMPT,     # the template your agent runs
-    prompt_version="v13",     # optional: your label for this version
-)
+report.set_custom_data({"ticket_id": "TKT-9001"})          # replaces custom_data
+report.update_custom_data({"appointment_booked": True})    # merges into it; other keys are kept
+report.set_call_end_reason("transfer_to_human")            # sent as ended_reason instead of the end frame's
+report.set_recording_url("https://my-bucket/.../call.mp3")  # production calls: your own recording (see below)
 ```
 
-- Every call carries `metadata.prompt_ref = {"hash": "sha256:...", "version": "v13"}`.
-- The template's text is pushed to SuperBryn once per process per version (`POST /public-api/v1/prompts`), with the tools found in the pipeline's LLM context.
-- When you deploy a changed prompt, the agent's settings in SuperBryn show the change and offer to make it a new version. A prompt saved but never deployed never shows up, because no call names it.
-- Prompt sync never holds a call back: if the push fails, the call is still sent, and it is matched once the prompt text arrives.
-- The API key needs the `obs:write` scope. Keys generated in Monitor > Configure have it; with an older key the observer logs `SUPERBRYN_PROMPT_SYNC_FORBIDDEN` once and keeps sending calls.
-- Without `prompt=`, the system prompt found in the pipeline's LLM context is sent as `metadata.system_prompt`. SuperBryn reads it as rendered text (it can differ per call), so a change shows up after a few calls instead of one.
-- Simulation runs (`simulate_*`) never sync: they test drafts, not the live prompt. Set `sync_prompt=False` to turn it off.
+### Custom data
 
-Any stack can compute the hash itself: `sha256` over the template's UTF-8 bytes, written `sha256:<hex>` (`superbryn_pipecat_observer.prompt_ref(template, version)`).
+`custom_data` is sent at the top of `call.ended` exactly as you give it: the same key names and the same value types
+(a value JSON can't hold, such as a `datetime`, is sent as its text). SuperBryn's pre-ingestion filters and profiles
+match these key names, so keys like `workflow_id` or `tenant_id` route production calls to the right source and
+profile. Set it in `attach(custom_data=...)` for what you know at the start, and with `set_custom_data()` or
+`update_custom_data()` for what you learn during the call.
+
+### Prompt sync
+
+Pass the prompt template your agent runs (placeholders unfilled) so SuperBryn knows exactly which prompt each call
+ran on:
+
+```python
+report = attach(task, runner_args, prompt=PROMPT_TEMPLATE, prompt_version="v13")
+```
+
+Each call carries `context.prompt_ref = {"hash": "sha256:...", "version": "v13"}`, and the template's text is pushed
+to SuperBryn once per host per version (`POST /public-api/v1/prompts`, which needs `obs:write`), with the tools in
+the pipeline's LLM context. A prompt change you deploy shows up in the agent's settings in SuperBryn. Every call also
+sends the system message of its LLM context as `context.system_prompt`, which SuperBryn matches as text when no
+`prompt=` is given. Any stack can compute the hash: `sha256` over the template's UTF-8 bytes, written `sha256:<hex>`
+(`superbryn_pipecat_observer.prompt_ref(template, version)`).
+
+## How a SuperBryn test call is recognised
+
+In this order:
+
+1. `superbryn_call_id=` is passed;
+2. `runner_args.body` has `superbryn_call_id` (webhook, Custom cURL and Pipecat Cloud starts);
+3. a Daily dial-in SIP header ends in `x-superbryn-call-id`;
+4. a telephony WebSocket carries a `superbryn_call_id` custom parameter (Twilio stream parameters, Exotel custom
+   parameters), read from `call_data=`, else `runner_args.call_data`, else the handshake your bot parsed itself with
+   `parse_telephony_websocket`;
+5. otherwise, the caller or the dialled number is one of SuperBryn's test numbers (fetched with your key, any valid
+   SuperBryn API key, and cached for an hour in a temp file every process on the host shares; a refused key is
+   asked again after an hour, an unanswered fetch after a minute). A test call's data is stored only with
+   `test_data:write`: with a Monitor-only key, SuperBryn's test calls are recognised and kept out of Monitor.
+
+A value that still holds a template placeholder such as `{From}` is ignored, with a warning. A call SuperBryn says is
+not one of its tests is not reported again as a production call.
+
+A test call's `call_id` is the telephony call's own ID (`call_data.call_id`, the Daily dial-in `call_id`), which
+SuperBryn's Custom cURL trigger matches; a production call's is `runner_args.session_id`, the ID 0.11 gave Monitor
+calls. `call_id=` names both.
+
+## Production calls
+
+**Recording.** Unless `record=False`, a production call is recorded in stereo, the caller on the left channel and the
+agent on the right: `attach` puts Pipecat's `AudioBufferProcessor` right before your output transport. When the call
+ends, the WAV goes straight to SuperBryn's storage through a short-lived presigned URL fetched with your key, and the
+temp file is deleted. No S3 settings are needed. A recording that can't be made or uploaded leaves the call
+unrecorded, never unreported. A call recognised as a SuperBryn test is never recorded. `attach` must run before the
+task does: once the pipeline runs, no recorder can be added (one warning).
+
+**Your own recording.** Pass its URL (public or pre-signed) with `report.set_recording_url(url)`; set before the
+task runs, SuperBryn's recording is not started. It is sent with `recording_url_source: "external"`.
+
+`observability` also carries `mode` (`observe`, or `track` with `simulation=True`) and, on Daily dial-in and dial-out
+calls, `direction`.
+
+## What a report contains
+
+`POST {base_url}/public-api/v1/calls/agent-data`, with the key in `X-API-Key`. Every event repeats the call's identity:
+`schema_version`, `event_id` (`pc:<call_id>:started` or `:ended`, the same on a retry), `event`, `surface`,
+`source: "pipecat"`, `call_id`, `agent_id`, `from`, `to`, and `started_at`, when the pipeline started. Every
+`start_ms`, `end_ms` and `at_ms` counts from `started_at`. `call.ended` adds:
+
+| Field | What it holds |
+|-------|---------------|
+| `ended_at`, `ended_reason`, `ended_by` | When the pipeline finished; why (`ended`, `cancelled`, `stopped`, `error`, or yours); and who ended it when that is known: `agent` (a processor such as an end-call tool asked the pipeline to end), `caller` (the transport's client disconnected first) or `system` (a fatal error). |
+| `transcript[]` | Each line: `id`, `role`, `text`, `start_ms`, `end_ms`; caller lines `confidence`; agent lines `interrupted`. Agent text is what the output transport played. |
+| `tool_calls[]` | `id`, `name`, `arguments`, `result`, `is_error`, `start_ms`, `end_ms`, and `turn_id`, the agent line it fed; `<tool_use>{...}</tool_use>` blocks an LLM was prompted to write are lifted out of the text as tool calls. |
+| `diagnostics` | `pipeline`; `configuration` (STT, LLM and TTS with the voice, turn detection, interruptions, tools); `turn_latencies[]` per reply (`transcriber_ms`, `endpointing_ms`, `model_ms`, `voice_ms`, `turn_ms`); `usage`; `llm_requests[]` with each one's outcome; `errors[]`; `dtmf[]`; and, on production calls, `logs[]` (`ts`, `level`, `name`, `message`). |
+| `context` | `system_prompt`, `prompt_ref`, `room_url` (the Daily room), and `environment` (this package's, Pipecat's and Python's versions, the transport, and 0.11's `pipeline_version` tag). |
+| `custom_data` | Your keys, as given. |
+| `testing` | Test calls: `superbryn_call_id`, when the call carried one. |
+| `observability` | Production calls: `mode` and `direction`, and `recording_url`, `stereo_recording_url`, `recording_url_source` on `call.ended`. |
+
+No audio is sent in the body, and the package computes no averages: SuperBryn works them out from these records.
+Latency and usage need Pipecat's metrics: `attach` switches on `enable_metrics` and `enable_usage_metrics` when your
+`PipelineParams` leave them unset, and logs one warning when you turned one off.
 
 ## Agent Config Sync (opt-in)
 
@@ -189,7 +180,7 @@ sync_config(
 )
 ```
 
-The helper walks the pipeline's processors — recursing into nested pipelines, `ParallelPipeline` branches, and `ServiceSwitcher` / `LLMSwitcher` members, and unwrapping custom wrapper classes — to fill the `llm` / `stt` / `tts` / `voice` blocks automatically. For switchers, the primary (initially active) service fills the block and the next member is reported in its `fallback` sub-block. It also reads the LLM context to fill `behavior.prompt` (the system message) and `tools` (the advertised function schemas) — explicit `behavior=` / `tools=` overrides always win. Extraction reads a fixed allow-list of configuration attributes (including private fields like `_settings`, `_model`, `_voice_id` where Pipecat services store their settings); credential attributes such as provider API keys are never part of that list and are never read or transmitted. The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_pipeline(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
+The helper walks the pipeline's processors — recursing into nested pipelines, `ParallelPipeline` branches, and `ServiceSwitcher` / `LLMSwitcher` members, and unwrapping custom wrapper classes — to fill the `llm` / `stt` / `tts` / `voice` blocks automatically. For switchers, the primary (initially active) service fills the block and the next member is reported in its `fallback` sub-block. It also reads the LLM context to fill `behavior.prompt` (the system message) and `tools` (the advertised function schemas) — explicit `behavior=` / `tools=` overrides always win. Extraction reads a fixed allow-list of configuration attributes (including private fields like `_settings`, `_model`, `_voice_id` where Pipecat services store their settings); credential attributes such as provider API keys are never part of that list and are never read or transmitted. The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_pipeline(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing. The API origin is `base_url=`, else `SUPERBRYN_BASE_URL`, else `SUPERBRYN_API_BASE_URL`, else `https://api.superbryn.com`.
 
 Override sections accept exactly the fields of the canonical manifest schema (unknown keys raise `ValueError` locally — the endpoint rejects them anyway):
 
@@ -205,243 +196,133 @@ Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurr
 
 Docs: https://docs.superbryn.com/advanced/agent-sync
 
-## Testing data (eval mode)
+## Logs
 
-For SuperBryn test calls only, `attach_test_data` sends your agent's own record of the call to SuperBryn: `call.started` when the pipeline starts, and `call.ended` when it finishes, with the transcript, tool calls and diagnostics. Every other call sends nothing, and audio is never sent. It is independent of `SuperbrynObserver`; use either or both.
+Log lines (logger `superbryn_pipecat_observer.call_report`) start with `SUPERBRYN_CALL_REPORT_`: `SENT` when SuperBryn
+accepted an event (with any optional field it dropped), `DISABLED` without an API key or with
+`SUPERBRYN_OBSERVER_ENABLED` off, `WARNING` for an agent ID that isn't a UUID or caller numbers the key can't read,
+`RETRY`, `REJECTED` (with what to change) and `FAILED` for delivery problems, and `ERROR` for anything else. None of
+them affects the call. When the pipeline finishes, the work before the recording's upload (`call.started`, the end
+frame, finishing the file and getting its upload URL) gets at most 12 seconds, and `call.ended` after it 12 more; the upload itself can take up to 2 minutes for a long call, after the caller has gone.
+
+## Upgrading from 0.11
+
+0.12.0 replaces both 0.11 entry points (`SuperbrynObserver` with `monitor_and_create_task` /
+`simulate_and_create_task` for production calls, and `attach_test_data` for SuperBryn test calls) with `attach`. It
+posts a new body to a new endpoint, so pin the new version and change the setup in the same deploy.
+
+**Before (0.11):**
 
 ```python
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from superbryn_pipecat_observer import attach_test_data
+from pipecat.pipeline.runner import PipelineRunner
+from superbryn_pipecat_observer import SuperbrynObserver, attach_test_data
 
 
 async def bot(runner_args):
     ...
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    observer = SuperbrynObserver(
+        agent_id="support-bot",
+        agent_name="Support Bot",
+        custom_metadata={"workflow_id": "wf_inbound", "tenant_id": 42},
+        prompt=PROMPT, prompt_version="v13",
     )
-    attach_test_data(task, runner_args)  # before the task runs
-    await runner.run(task)
+    task = observer.monitor_and_create_task(
+        pipeline, context, runner_args=runner_args, transport=transport, idle_timeout_secs=120
+    )
+    attach_test_data(task, runner_args)
+    ...
+    observer.set_custom_metadata({"booked": True})
+    await PipelineRunner().run(task)
 ```
 
-| Variable | Meaning |
-|---|---|
-| `SUPERBRYN_TEST_API_KEY` | Org API key with the `test_data:write` scope; falls back to `SUPERBRYN_API_KEY`. Without a key nothing is sent. |
-| `SUPERBRYN_AGENT_ID` | Your SuperBryn agent ID (a UUID). Without it nothing is sent. |
-| `SUPERBRYN_BASE_URL` | Defaults to `https://api.superbryn.com`. |
-
-Keyword arguments override these (`api_key=`, `agent_id=`, `base_url=`), and `superbryn_call_id=`, `from_number=`, `to_number=`, `call_id=` and `call_data=` (a parsed telephony handshake) pass values your bot already knows.
-
-A call is a SuperBryn test call when, in this order:
-
-1. `superbryn_call_id=` is passed;
-2. `runner_args.body` has `superbryn_call_id` (webhook, custom cURL and Pipecat Cloud starts);
-3. a Daily dial-in SIP header ends in `x-superbryn-call-id`;
-4. a telephony WebSocket carries a `superbryn_call_id` custom parameter (Twilio stream parameters, Exotel custom parameters), read from `call_data=`, else `runner_args.call_data`, else the handshake your bot parsed itself with `parse_telephony_websocket`;
-5. otherwise, the caller or dialled number is one of SuperBryn's test numbers.
-
-A value that still holds a template placeholder such as `{From}` is ignored, with a warning. A call with neither a test ID nor phone numbers logs one `INFO` line and sends nothing.
-
-`call.ended` carries:
-
-- `transcript`: user turns timed by VAD (or, in realtime pipelines without VAD, by the service's own turn frames) with their final transcripts; what the user says while a user mute strategy is active is left out, as the agent never hears it. Agent turns run from bot started to bot stopped speaking, with the text the output transport played and whether the user interrupted; the LLM text stands in only when the pipeline never reports played text, and never for an interrupted turn.
-- `tool_calls`: name, arguments, result, start and end, and the agent turn each belongs to.
-- `diagnostics.turn_latencies`: per reply, `turnLatency` (user stopped speaking to bot started), `endpointingLatency` (user stopped speaking to the turn's release, including the stop strategy's wait), `transcriberLatency`, `modelLatency` and `voiceLatency`.
-- `diagnostics.configuration`: STT, LLM and TTS provider and model, the TTS voice, turn detection, and the LLM's tools.
-- `diagnostics.usage`: LLM input, cached input and output tokens, and TTS characters.
-- `diagnostics.errors`: every error frame by pipeline step (`stt`, `llm`, `tts`, or `telephony` for a transport), whether that step worked again later, and a fatal one never recovered. A tool handler that raised is `is_error` on its tool call instead.
-- `diagnostics.configuration.interruptions`: from the user turn start strategies: enabled, `min_words` (the min-words strategy) and `min_duration_ms` (VAD's start time when the VAD strategy is used).
-- Caller turns carry the STT's `confidence` when the provider's result has one (Deepgram, Google, Gladia, AWS Transcribe, Soniox), and `usage.stt_audio_ms` is the STT usage Pipecat reports, or on Pipecat 1.4 (which reports none) the audio delivered to a streaming STT while it isn't muted; a segmented STT gets none.
-- `diagnostics.llm_requests`: every LLM response, with when it started, its tokens and what became of it: `spoken`, `cut_off` (the caller cut in), `not_spoken` (generated, never played), `stopped` (nothing came back) or `tool_call` (only a tool call).
-
-Latency and usage need `enable_metrics=True` and `enable_usage_metrics=True` in `PipelineParams`; a warning is logged when either is off. Attaching after the task started logs a warning and times the call from the first frame seen. When the pipeline finishes, sending `call.ended` gets at most 12 seconds; a call without a test ID that ends before the SuperBryn-number check finishes sends nothing and adds no wait. Log lines start with `SUPERBRYN_TEST_DATA`; a `401` or `403` means the key lacks `test_data:write`.
-
-## How It Works
-
-1. **Pipeline observation.** The observer is registered via `PipelineTask(observers=[...])` — it runs **alongside** your pipeline, not inside it.
-2. **Frame inspection.** `on_push_frame` watches every frame flowing between processors and aggregates by class name, so a Pipecat upgrade doesn't break it.
-3. **Auto-detection.** The observer inspects each service's module path (`pipecat.services.<provider>.<role>`) to tag LLM / STT / TTS provider, model, and voice ID automatically.
-4. **End-of-session delivery.** When the call ends (`EndFrame` / `CancelFrame` / transport disconnect), the SDK builds a normalized call payload and POSTs it to SuperBryn.
-
-## Webhook Payload
-
-```json
-{
-  "event": "call.completed",
-  "sdk_version": "@superbryn/pipecat-observer@0.11.0",
-  "call": {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "started_at": "2026-06-15T12:00:00.000+00:00",
-    "ended_at": "2026-06-15T12:05:30.000+00:00",
-    "duration_seconds": 330.0,
-    "call_end_reason": "completed",
-    "from_number": "+15551234567",
-    "to_number": "+15557654321",
-    "transcript": {
-      "turns": [
-        {
-          "speaker": "user",
-          "text": "Hello, how are you?",
-          "start_time_ms": 5000,
-          "end_time_ms": 5000,
-          "confidence": 0.98
-        },
-        {
-          "speaker": "agent",
-          "text": "I'm doing great, thanks for asking!",
-          "start_time_ms": 7000,
-          "end_time_ms": 11000,
-          "latency_ms": 2000
-        }
-      ]
-    },
-    "metadata": {
-      "agent_id": "support-bot",
-      "agent_name": "support-bot",
-      "transport": "daily",
-      "llm_provider": "openai",
-      "llm_model": "gpt-4o-mini",
-      "stt_provider": "deepgram",
-      "stt_model": "nova-3",
-      "tts_provider": "cartesia",
-      "tts_model": "sonic-english",
-      "tts_voice_id": "...",
-      "pipeline_version": "@superbryn/pipecat-observer@0.11.0",
-      "mode": "observe"
-    },
-    "usage": {
-      "llm_input_tokens": 1250,
-      "llm_output_tokens": 850,
-      "stt_duration_seconds": 45.2,
-      "tts_characters": 1200,
-      "llm_total_tokens": 2100,
-      "llm_cache_read_input_tokens": 800,
-      "llm_reasoning_tokens": 64,
-      "llm_input_audio_tokens": 0
-    },
-    "latency": {
-      "avg_ms": 750.5,
-      "p95_ms": 1240.0,
-      "avg_ttfb_ms": 335.0,
-      "p95_ttfb_ms": 480.0,
-      "avg_ttfa_ms": 260.0,
-      "avg_tts_leading_silence_ms": 70.0,
-      "avg_processing_ms": 1100.0,
-      "avg_text_aggregation_ms": 50.0,
-      "avg_turn_detection_ms": 310.0,
-      "by_service": {
-        "AnthropicLLM": { "avg_ttfb_ms": 480.0, "avg_processing_ms": 1100.0 },
-        "CartesiaTTS": { "avg_ttfb_ms": 190.0, "avg_ttfa_ms": 260.0 }
-      }
-    },
-    "tool_calls": [
-      {
-        "tool_call_id": "call_abc123",
-        "function_name": "get_cart",
-        "arguments": { "user_id": "u_42" },
-        "result": { "items": [] },
-        "timestamp_ms": 8200
-      }
-    ],
-    "turn_detection": {
-      "avg_e2e_processing_ms": 310.0,
-      "max_e2e_processing_ms": 540.0,
-      "prediction_count": 12,
-      "incomplete_predictions": 3,
-      "avg_probability": 0.91,
-      "events": [
-        { "timestamp_ms": 5200, "is_complete": true, "probability": 0.94, "e2e_processing_time_ms": 302.0 }
-      ]
-    },
-    "speech_stats": {
-      "user_talk_seconds": 41.2, "agent_talk_seconds": 88.6,
-      "user_turn_count": 12, "agent_turn_count": 13,
-      "avg_user_turn_seconds": 3.4, "avg_agent_turn_seconds": 6.8,
-      "agent_talk_ratio": 0.683, "silence_seconds": 20.2, "longest_silence_ms": 4100,
-      "avg_response_delay_ms": 910.4, "max_response_delay_ms": 2210.0
-    },
-    "interruptions": { "interruption_count": 2, "bot_turns_interrupted": 2, "user_idle_timeouts": 0 },
-    "errors": [
-      { "timestamp_ms": 84200, "message": "deepgram websocket closed: 1011",
-        "fatal": false, "processor": "DeepgramSTTService", "exception_type": "ConnectionClosed" }
-    ],
-    "connection": [
-      { "type": "ClientConnectedFrame", "timestamp_ms": 120 },
-      { "type": "OutputTransportReadyFrame", "timestamp_ms": 180 }
-    ],
-    "sip": { "attributes": {}, "dtmf": [ { "timestamp_ms": 32000, "digit": "1", "direction": "input" } ] },
-    "vad": {
-      "segment_count": 12, "total_speech_seconds": 41.2, "avg_segment_ms": 3433.0,
-      "params": { "start_secs": 0.2, "stop_secs": 0.8 },
-      "segments": [ { "start_ms": 5000, "end_ms": 7500, "duration_ms": 2500 } ]
-    },
-    "pipeline": {
-      "services_seen": ["AnthropicLLMService", "CartesiaTTSService", "DeepgramSTTService"],
-      "service_metadata": {
-        "deepgram": { "ttfs_p99_ms": 420.0 },
-        "anthropic": { "is_realtime_service": false }
-      },
-      "frame_counts": { "InterruptionFrame": 2, "TranscriptionFrame": 12 },
-      "llm_thought_count": 0, "llm_thought_chars": 0
-    },
-    "environment": {
-      "observer_version": "0.8.0", "pipecat_version": "1.7.0", "python_version": "3.12.12"
-    }
-  }
-}
-```
-
-`tool_calls` is included only when the LLM invoked one or more tools.
-
-## Troubleshooting
-
-### Enable debug logs
+**After (0.12):**
 
 ```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("superbryn_pipecat_observer").setLevel(logging.DEBUG)
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from superbryn_pipecat_observer import attach
+
+
+async def bot(runner_args):
+    ...
+    task = PipelineTask(pipeline, params=PipelineParams(), idle_timeout_secs=120)
+    report = attach(
+        task, runner_args,
+        custom_data={"workflow_id": "wf_inbound", "tenant_id": 42,
+                     "agent_id": "support-bot", "agent_name": "Support Bot"},
+        prompt=PROMPT, prompt_version="v13",
+    )
+    ...
+    report.update_custom_data({"booked": True})
+    await PipelineRunner().run(task)
 ```
 
-### Log messages to look for
+Environment: `SUPERBRYN_API_KEY` is one key with both `test_data:write` and `obs:write` (it replaces
+`SUPERBRYN_TEST_API_KEY`); `SUPERBRYN_AGENT_ID` is the agent's SuperBryn ID, a UUID (a free-form `AGENT_ID` is not
+read; drop it when you use the agent's own key); `SUPERBRYN_BASE_URL` is the API origin (it replaces
+`SUPERBRYN_WEBHOOK_URL` and `WEBHOOK_URL`; config sync still falls back to `SUPERBRYN_API_BASE_URL`).
 
-| Log prefix | Meaning |
-|---|---|
-| `SUPERBRYN_PIPECAT_CALL_STARTED` | Observer initialized for this session |
-| `SUPERBRYN_PIPECAT_SENDING` | Webhook about to be sent |
-| `SUPERBRYN_PIPECAT_PAYLOAD` | Full outbound payload (debug aid) |
-| `SUPERBRYN_PIPECAT_SENT` | Webhook delivered successfully (HTTP 200) |
-| `SUPERBRYN_PIPECAT_SKIPPED` | No API key configured — observer no-ops |
-| `SUPERBRYN_PIPECAT_AUTH_FAILED` | Invalid or revoked API key (401/403) |
-| `SUPERBRYN_PIPECAT_PAYLOAD_TOO_LARGE` | JSON exceeded the 20 MB backend cap |
-| `SUPERBRYN_PIPECAT_HTTP_*` | Non-2xx response from the SuperBryn server |
-| `SUPERBRYN_PIPECAT_ERROR` | Network / exception during delivery |
-| `SUPERBRYN_PIPECAT_MISSING_AIOHTTP` | `aiohttp` not installed in the runtime |
-| `SUPERBRYN_PIPECAT_SESSION_DISCARDED` | Session aborted — no webhook sent |
+What else changed:
 
-### Common errors
+- You build the `PipelineTask` yourself (with the `PipelineTask` keywords you passed to `monitor_and_create_task`),
+  then call `attach`; it adds the recorder before the output transport, as `monitor_*` did. Remove a
+  `SuperbrynAudioRecorder` you placed in the pipeline yourself, and the observer from `observers=[...]`.
+  `simulate_and_create_task` is `attach(..., simulation=True)`. Recording is always stereo.
+- `custom_metadata`, `extra_metadata` and `set_custom_metadata()` are `custom_data` and `update_custom_data()`, sent
+  in the body's `custom_data` (0.11 sent them in `call.metadata`). `agent_name`, and an `agent_id` that is not a
+  SuperBryn UUID, are not options any more: keep them in `custom_data` under the same names if your filters use them.
+- `session_id=` is `call_id=`; `recording_url=` / `stereo_recording_url=` are `report.set_recording_url(url)`;
+  `capture_logs` and `prompt` / `prompt_version` are unchanged. `transport`, `audio_recorder`, `extended_capture`,
+  `max_log_records`, `first_message`, `sync_prompt`, `enabled`, `num_channels` and `defer_upload` (with
+  `start_audio_upload()` and `abort()`) are gone.
+- The package no longer sends averages or counts (`latency.avg_ms` / `p95_ms`, `speech_stats`, turn-detection,
+  interruption, VAD, connection and pipeline summaries, `duration_seconds`); SuperBryn computes them from the raw
+  records. Turn latency keys are snake_case (`transcriber_ms`, `endpointing_ms`, `model_ms`, `voice_ms`, `turn_ms`).
+- `ended_reason` is `ended` / `cancelled` / `stopped` / `error` (0.11's production calls said `completed` /
+  `cancelled`).
 
-| Error | Cause | Fix |
-|---|---|---|
-| `SUPERBRYN_API_KEY not configured` | Missing API key | Set `SUPERBRYN_API_KEY` in your environment |
-| `SUPERBRYN_PIPECAT_AUTH_FAILED (401)` | Invalid API key | Verify the key in SuperBryn → API keys |
-| `SUPERBRYN_PIPECAT_AUTH_FAILED (403)` | Expired / disabled key | Generate a new API key |
-| `SUPERBRYN_PIPECAT_MISSING_AIOHTTP` | `aiohttp` missing | `pip install aiohttp>=3.9.0` |
-| `SUPERBRYN_PIPECAT_PAYLOAD_TOO_LARGE` | Transcript / logs too large | Trim `custom_metadata` or pass `capture_logs=False` |
+**A prompt for your coding agent** (copy and paste):
 
-### Missing usage metrics
+```text
+Upgrade this Pipecat bot from superbryn-pipecat-observer 0.11 to 0.12.0 (pip: "superbryn-pipecat-observer>=0.12.0").
 
-Pipecat only emits `MetricsFrame`s when usage metrics are enabled. `monitor_and_create_task` / `simulate_and_create_task` / `register_task_handlers` switch it on for you, also on your own `PipelineParams`, unless you set `enable_usage_metrics=False` (a `SUPERBRYN_PIPECAT_METRICS_OFF` warning is logged). If you attach the observer to your own `PipelineTask` without `register_task_handlers`, pass `enable_usage_metrics=True`:
-
-```python
-PipelineTask(
-    pipeline,
-    observers=[observer],
-    params=PipelineParams(enable_usage_metrics=True),
-)
+1. Pin superbryn-pipecat-observer>=0.12.0 in the project's dependencies.
+2. Remove every use of the old API and its imports: SuperbrynObserver(...), SuperbrynAudioRecorder(...) (and its
+   recorder.processor inside the Pipeline([...])), observer.monitor_and_create_task(...),
+   observer.simulate_and_create_task(...), observer.monitor_pipeline(...), observer.simulate_pipeline(...), the
+   deprecated observe_* / track_* methods, observer.register_task_handlers(...), observer.attach_to_task(...), the
+   observer inside PipelineTask(observers=[...]), and attach_test_data(task, ...).
+3. Where monitor_and_create_task / simulate_and_create_task built the task, build it yourself:
+   task = PipelineTask(pipeline, params=<the params= passed before, else PipelineParams()>, <every other keyword
+   passed before>). Then add one call right after it and BEFORE the task runs:
+   report = attach(task, runner_args, ...)   (from superbryn_pipecat_observer import attach)
+   Pass runner_args when the bot has them (whatever was passed as runner_args= before). If attach_test_data was
+   given superbryn_call_id=, from_number=, to_number=, call_id= or call_data=, pass them to attach the same way.
+4. Map the old options onto attach:
+   - custom_metadata= and extra_metadata= -> custom_data= (one dict). Keep every key name and every value type
+     exactly as it is: SuperBryn's filters and profiles match on them (for example workflow_id).
+   - agent_name= -> add "agent_name": <same value> to custom_data. agent_id= -> if it is the agent's SuperBryn ID
+     (a UUID), pass agent_id= (or set SUPERBRYN_AGENT_ID); otherwise add "agent_id": <same value> to custom_data.
+   - session_id= -> call_id=.  prompt= / prompt_version= / capture_logs= -> the same names.
+   - simulate_and_create_task / simulate_pipeline -> attach(..., simulation=True).
+   - recording_url= / stereo_recording_url= -> report.set_recording_url(url), called right after attach.
+   - api_key= -> api_key=. webhook_url= / api_base_url= -> base_url= with the URL's origin only
+     (https://host, no path).
+   - Drop transport=, audio_recorder=, extended_capture=, max_log_records=, first_message=, sync_prompt=,
+     num_channels=. If sync_prompt=False was set, do not pass prompt=. If enabled=False was set, do not call
+     attach in that case.
+5. Replace observer.set_custom_metadata(...) with report.update_custom_data(...) (same argument), and
+   observer.get_custom_metadata() with the bot's own copy of the dict. If the observer is passed to other functions
+   or tools, pass `report` instead.
+6. If the bot uses defer_upload=True, observer.start_audio_upload() or observer.abort(), STOP and ask me: 0.12 has no
+   consent gate; the closest is attach(..., record=False).
+7. Environment and deployment config: put SuperBryn's Agent data key (it holds both
+   test_data:write and obs:write) in SUPERBRYN_API_KEY and remove SUPERBRYN_TEST_API_KEY; replace a free-form AGENT_ID with SUPERBRYN_AGENT_ID set to the agent's SuperBryn
+   agent ID (a UUID), or remove it when the key is the agent's own key; replace SUPERBRYN_WEBHOOK_URL / WEBHOOK_URL /
+   SUPERBRYN_API_BASE_URL with SUPERBRYN_BASE_URL set to the API origin (https://api.superbryn.com unless told
+   otherwise); remove VERSION_ID if only this package used it. Keep SUPERBRYN_OBSERVER_ENABLED as it is.
+8. Do not change anything else in the bot. Show the diff when done.
 ```
-
-Without it you'll still get the transcript, latency, and provider detection — but `llm_input_tokens`, `llm_output_tokens`, and `tts_characters` will be `0`.
 
 ## Links
 
@@ -450,15 +331,8 @@ Without it you'll still get the transcript, latency, and provider detection — 
 - [Issue tracker](https://github.com/superbryndev/superbryn-pipecat-observer/issues)
 - [Get an API key](https://app.superbryn.com/api-keys)
 
-## Support
-
-- Email: support@superbryn.com
-- GitHub issues: [Report a bug](https://github.com/superbryndev/superbryn-pipecat-observer/issues)
-
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+MIT, see [LICENSE](LICENSE).
 
----
-
-Made with ❤️ by [SuperBryn](https://www.superbryn.com)
+Made by [SuperBryn](https://www.superbryn.com). Support: support@superbryn.com

@@ -3,7 +3,7 @@ name: Publish to PyPI
 # The version in pyproject.toml is the single source of truth. This workflow
 # never bumps it: it publishes the declared version if (and only if) it is not
 # already on PyPI and has a matching CHANGELOG entry. To release, bump the
-# version (e.g. `bump2version minor` keeps pyproject.toml, observer.py and the
+# version (e.g. `bump2version minor` keeps pyproject.toml, __init__.py and the
 # README badge in lockstep), add the CHANGELOG section, and merge to main.
 
 on:
@@ -41,9 +41,9 @@ jobs:
           echo "Declared version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          INIT_VERSION=$(python -c "import re; print(re.search(r'__version__ = \"(.+?)\"', open('superbryn_pipecat_observer/observer.py').read()).group(1))")
+          INIT_VERSION=$(python -c "import re; print(re.search(r'__version__ = \"(.+?)\"', open('superbryn_pipecat_observer/__init__.py').read()).group(1))")
           if [ "$VERSION" != "$INIT_VERSION" ]; then
-            echo "::error::pyproject.toml ($VERSION) and observer.py ($INIT_VERSION) disagree"
+            echo "::error::pyproject.toml ($VERSION) and __init__.py ($INIT_VERSION) disagree"
             exit 1
           fi
 

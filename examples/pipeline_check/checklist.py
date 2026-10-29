@@ -1,11 +1,11 @@
-"""Compares what each SDK path sent against what actually happened."""
+"""Compares what attach() sent against what actually happened."""
 
 from __future__ import annotations
 
 import io
-import statistics
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from catcher import Caught
@@ -34,8 +34,9 @@ class Check:
 class Expected:
     api_key: str
     agent_id: str
-    agent_name: str
-    custom_metadata: dict[str, Any]
+    surface: str  # "observability" (a production call) or "testing" (a SuperBryn test call)
+    call_id: str
+    custom_data: dict[str, Any]
     # What the bot actually got out, greeting first; the interrupted reply cut to what was heard
     agent_lines: list[str]
     unspoken: list[str]
@@ -59,7 +60,6 @@ def run_checks(
     truth: GroundTruth,
     want: Expected,
     *,
-    session_id: str,
     wall_seconds: float,
 ) -> list[Check]:
     checks: list[Check] = []
@@ -74,227 +74,45 @@ def run_checks(
         truth.interruptions == want.interruptions,
         truth.interruptions,
     )
-    _obs_checks(check, caught, truth, want, session_id, wall_seconds)
-    _evals_checks(check, caught, truth, want)
+    ended = _report_checks(check, caught, truth, want, wall_seconds)
+    if ended is not None and want.surface == "observability":
+        _production_checks(check, caught, truth, want, ended)
+    elif ended is not None:
+        check("test", "test ID sent", ended.get("testing") == {"superbryn_call_id": want.call_id})
+        check("test", "no recording", not caught.presign_requests and "observability" not in ended)
+        check("test", "no session logs", "logs" not in (ended.get("diagnostics") or {}))
     return checks
 
 
-# ── Obs: SuperbrynObserver → /webhooks/obs/pipecat ──────────────────────────
+# ── attach() → /public-api/v1/calls/agent-data ─────────────────────────────
 
 
-def _obs_checks(check, caught, truth, want, session_id, wall_seconds) -> None:
-    a = "obs"
-    check(a, "exactly one webhook", len(caught.webhooks) == 1, len(caught.webhooks))
-    if not caught.webhooks:
-        return
-    payload, headers = caught.webhooks[0], caught.webhook_headers[0]
-    call = payload.get("call") or {}
-    meta = call.get("metadata") or {}
-    usage = call.get("usage") or {}
-    turns = (call.get("transcript") or {}).get("turns") or []
-
-    check(a, "X-API-Key header sent", headers.get("X-API-Key") == want.api_key)
-    check(a, "event is call.completed", payload.get("event") == "call.completed")
-    check(a, "call id is the session id", call.get("id") == session_id)
-    duration = call.get("duration_seconds") or 0
+def _report_checks(check, caught, truth, want, wall_seconds) -> dict[str, Any] | None:
+    a = "report"
+    kinds = [e.get("event") for e in caught.events]
+    check(a, "call.started then call.ended", kinds == ["call.started", "call.ended"], kinds)
+    ended = next((e for e in caught.events if e.get("event") == "call.ended"), None)
+    if ended is None:
+        return None
+    check(a, "X-API-Key header sent", caught.event_headers[-1].get("X-API-Key") == want.api_key)
+    check(
+        a,
+        "surface, source and call id",
+        (ended.get("surface"), ended.get("source"), ended.get("call_id"))
+        == (want.surface, "pipecat", want.call_id),
+        (ended.get("surface"), ended.get("source"), ended.get("call_id")),
+    )
+    check(a, "agent_id sent", ended.get("agent_id") == want.agent_id, ended.get("agent_id"))
+    check(a, "ended_reason set", ended.get("ended_reason") == "ended", ended.get("ended_reason"))
+    seconds = (_time(ended["ended_at"]) - _time(ended["started_at"])).total_seconds()
     check(
         a,
         "duration within 2s of wall clock",
-        abs(duration - wall_seconds) <= 2,
-        f"{duration:.2f}s vs {wall_seconds:.2f}s",
+        abs(seconds - wall_seconds) <= 2,
+        f"{seconds:.2f}s vs {wall_seconds:.2f}s",
     )
-    check(a, "end reason completed", call.get("call_end_reason") == "completed")
-
-    # Transcript
-    user_texts = [t["text"] for t in turns if t.get("speaker") == "user"]
-    agent_texts = [t["text"] for t in turns if t.get("speaker") == "agent"]
-    check(
-        a,
-        "user turns = caller lines",
-        user_texts == truth.user_lines,
-        _diff(truth.user_lines, user_texts),
-    )
-    check(
-        a,
-        "agent turns = what the bot said",
-        _same_lines(agent_texts, want),
-        _diff(want.agent_lines, agent_texts),
-    )
-    check(a, "no duplicated agent text", not _repeats(agent_texts), _repeats(agent_texts))
-    check(
-        a,
-        "numbers kept whole (884291)",
-        all("884 291" not in t for t in agent_texts),
-        [t for t in agent_texts if "884 291" in t],
-    )
-    for line in want.unspoken:
-        check(a, "unheard words left out", all(line not in t for t in agent_texts), line)
-    starts = [t.get("start_time_ms") for t in turns]
-    check(
-        a,
-        "turn start times increase",
-        all(x <= y for x, y in zip(starts, starts[1:], strict=False)),
-        starts,
-    )
-
-    # Latency
-    first_replies = _first_reply_after_each_user(turns, "speaker", "latency_ms")
-    _latency_check(check, a, first_replies, truth.perceived_latency_ms)
-    lat = call.get("latency") or {}
-    valid = [v for v in first_replies if v is not None]
-    if valid:
-        check(
-            a,
-            "avg_ms = mean of reply latencies",
-            lat.get("avg_ms") is not None and abs(lat["avg_ms"] - statistics.mean(valid)) < 1,
-            f"{lat.get('avg_ms')} vs {statistics.mean(valid):.1f}",
-        )
-
-    # Usage
-    _usage_check(
-        check, a, "LLM input tokens", usage.get("llm_input_tokens"), truth.llm_prompt_tokens, want
-    )
-    _usage_check(
-        check,
-        a,
-        "LLM output tokens",
-        usage.get("llm_output_tokens"),
-        truth.llm_completion_tokens,
-        want,
-    )
-    _usage_check(
-        check,
-        a,
-        "TTS characters",
-        usage.get("tts_characters"),
-        sum(map(len, truth.tts_texts)),
-        want,
-    )
-    stt = usage.get("stt_duration_seconds") or 0
-    if STT_USAGE_REPORTED:
-        # Pipecat measures the audio it hands the STT, pre-speech buffer included
-        check(
-            a,
-            "STT seconds = audio sent to the STT",
-            abs(stt - truth.stt_audio_seconds) <= 0.1,
-            f"{stt} vs {truth.stt_audio_seconds:.2f}",
-        )
-    else:
-        # Older Pipecat reports none; the observer falls back to the caller's turns
-        check(
-            a,
-            "STT seconds within 0.6s of caller turns",
-            abs(stt - truth.user_turn_seconds) <= 0.6,
-            f"{stt} vs {truth.user_turn_seconds:.2f}",
-        )
-
-    # Metadata
-    expected_meta = {
-        "agent_id": want.agent_id,
-        "agent_name": want.agent_name,
-        "transport": "localmock",
-        "llm_provider": PROVIDERS["llm"][0],
-        "llm_model": PROVIDERS["llm"][1],
-        "stt_provider": PROVIDERS["stt"][0],
-        "stt_model": PROVIDERS["stt"][1],
-        "tts_provider": PROVIDERS["tts"][0],
-        "tts_model": PROVIDERS["tts"][1],
-        "tts_voice_id": VOICE_ID,
-        "mode": "observe",
-        **want.custom_metadata,
-    }
-    wrong = {k: meta.get(k) for k, v in expected_meta.items() if meta.get(k) != v}
-    check(
-        a,
-        "metadata fields (agent, providers, models, voice, custom)",
-        not {k for k in wrong if k != "transport"},
-        wrong,
-    )
-    check(a, "metadata.transport set", meta.get("transport") == "localmock", meta.get("transport"))
-    check(a, "system prompt captured", bool(meta.get("system_prompt")))
-
-    # Tools
-    sent = call.get("tool_calls") or []
-    check(
-        a,
-        "one record per tool call",
-        len(sent) == len(truth.tool_calls),
-        f"{len(sent)} vs {len(truth.tool_calls)}",
-    )
-    _tool_checks(check, a, sent, truth, id_key="tool_call_id", name_key="function_name")
-
-    # Recording
-    check(
-        a,
-        "one WAV uploaded for this session",
-        [r.get("session_id") for r in caught.presign_requests] == [session_id]
-        and len(caught.uploads) == 1,
-    )
-    url = call.get("stereo_recording_url")
-    check(
-        a,
-        "stereo_recording_url points at the upload",
-        bool(url) and url.rsplit("/", 1)[-1] in caught.uploads,
-        url,
-    )
-    for wav_bytes in list(caught.uploads.values())[:1]:
-        _wav_checks(check, a, wav_bytes, duration, truth)
-
-    # Extended sections
-    timings = lat.get("by_service") or {}
-    check(
-        a,
-        "per-service TTFB present",
-        {"llm", "stt", "tts"} <= {_kind(k) for k, v in timings.items() if "avg_ttfb_ms" in v},
-        sorted(timings),
-    )
-    speech = call.get("speech_stats") or {}
-    check(
-        a,
-        "speech_stats turn counts",
-        speech.get("user_turn_count") == len(truth.user_lines)
-        and speech.get("agent_turn_count") == len(want.agent_lines),
-        f"user {speech.get('user_turn_count')}, agent {speech.get('agent_turn_count')}",
-    )
-    check(
-        a,
-        "one VAD segment per caller line",
-        (call.get("vad") or {}).get("segment_count") == len(truth.user_lines),
-        (call.get("vad") or {}).get("segment_count"),
-    )
-    interruptions = call.get("interruptions") or {}
-    check(
-        a,
-        "interruption count",
-        interruptions.get("interruption_count") == want.interruptions,
-        interruptions,
-    )
-    check(
-        a,
-        "interrupted bot turns",
-        interruptions.get("bot_turns_interrupted") == want.interruptions,
-        interruptions,
-    )
-    check(a, "no pipeline errors", not call.get("errors"), call.get("errors"))
-    messages = [e.get("message") for e in call.get("logs") or []]
-    for source, line in want.log_lines.items():
-        check(a, f"agent log via {source} captured", line in messages, f"{len(messages)} lines")
-
-
-# ── Evals: attach_test_data → /public-api/v1/test-calls/agent-data ─────────
-
-
-def _evals_checks(check, caught, truth, want) -> None:
-    a = "evals"
-    kinds = [e.get("event") for e in caught.test_events]
-    check(a, "call.started then call.ended", kinds == ["call.started", "call.ended"], kinds)
-    ended = next((e for e in caught.test_events if e.get("event") == "call.ended"), None)
-    if ended is None:
-        return
     diag = ended.get("diagnostics") or {}
     turns = ended.get("transcript") or []
-    check(a, "agent_id sent", ended.get("agent_id") == want.agent_id, ended.get("agent_id"))
-    check(a, "ended_reason set", bool(ended.get("ended_reason")), ended.get("ended_reason"))
 
     # Transcript
     user_texts = [t["text"] for t in turns if t.get("role") == "user"]
@@ -327,10 +145,17 @@ def _evals_checks(check, caught, truth, want) -> None:
             for t in turns
         ),
     )
+    starts = [t.get("start_ms") for t in turns]
+    check(
+        a,
+        "turn start times increase",
+        all(x <= y for x, y in zip(starts, starts[1:], strict=False)),
+        starts,
+    )
 
-    # Latency
+    # Latency: raw per-reply parts; SuperBryn works out averages
     latencies = diag.get("turn_latencies") or []
-    reported = [e.get("turnLatency") for e in latencies]
+    reported = [e.get("turn_ms") for e in latencies]
     check(
         a,
         "one turn latency per caller line",
@@ -339,7 +164,7 @@ def _evals_checks(check, caught, truth, want) -> None:
     )
     if len(reported) == len(truth.perceived_latency_ms):
         _latency_check(check, a, reported, truth.perceived_latency_ms)
-    parts = ("endpointingLatency", "transcriberLatency", "modelLatency", "voiceLatency")
+    parts = ("endpointing_ms", "transcriber_ms", "model_ms", "voice_ms")
     check(
         a,
         "latency broken into endpointing/STT/LLM/TTS",
@@ -368,6 +193,15 @@ def _evals_checks(check, caught, truth, want) -> None:
         sum(map(len, truth.tts_texts)),
         want,
     )
+    if STT_USAGE_REPORTED:
+        # Pipecat measures the audio it hands the STT, pre-speech buffer included
+        stt = (usage.get("stt_audio_ms") or 0) / 1000
+        check(
+            a,
+            "STT seconds = audio sent to the STT",
+            abs(stt - truth.stt_audio_seconds) <= 0.1,
+            f"{stt} vs {truth.stt_audio_seconds:.2f}",
+        )
 
     # Configuration
     config = diag.get("configuration") or {}
@@ -420,6 +254,54 @@ def _evals_checks(check, caught, truth, want) -> None:
     check(a, "LLM requests and outcomes", outcomes == expected_outcomes, outcomes)
     check(a, "no errors", diag.get("errors") == [], diag.get("errors"))
 
+    # Context and custom data
+    context = ended.get("context") or {}
+    check(a, "system prompt captured", bool(context.get("system_prompt")))
+    environment = context.get("environment") or {}
+    check(a, "transport named", environment.get("transport") == "localmock", environment)
+    check(
+        a,
+        "custom_data sent as given",
+        ended.get("custom_data") == want.custom_data,
+        ended.get("custom_data"),
+    )
+    return ended
+
+
+def _production_checks(check, caught, truth, want, ended) -> None:
+    a = "production"
+    observability = ended.get("observability") or {}
+    check(a, "mode observe", observability.get("mode") == "observe", observability)
+    check(
+        a,
+        "one WAV uploaded for this call",
+        [r.get("session_id") for r in caught.presign_requests] == [want.call_id]
+        and len(caught.uploads) == 1,
+    )
+    url = observability.get("stereo_recording_url")
+    check(
+        a,
+        "stereo_recording_url points at the upload",
+        bool(url) and url.rsplit("/", 1)[-1] in caught.uploads,
+        url,
+    )
+    check(
+        a,
+        "recording_url_source superbryn_s3",
+        observability.get("recording_url_source") == "superbryn_s3"
+        and observability.get("recording_url") == url,
+    )
+    seconds = (_time(ended["ended_at"]) - _time(ended["started_at"])).total_seconds()
+    for wav_bytes in list(caught.uploads.values())[:1]:
+        _wav_checks(check, a, wav_bytes, seconds, truth)
+    messages = [e.get("message") for e in (ended.get("diagnostics") or {}).get("logs") or []]
+    for source, line in want.log_lines.items():
+        check(a, f"agent log via {source} captured", line in messages, f"{len(messages)} lines")
+
+
+def _time(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
 
 # ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -457,18 +339,6 @@ def _tool_checks(
             )
 
 
-def _first_reply_after_each_user(turns: list[dict], role_key: str, latency_key: str) -> list[Any]:
-    out = []
-    for i, t in enumerate(turns):
-        if t.get(role_key) == "user":
-            out.append(
-                next(
-                    (n.get(latency_key) for n in turns[i + 1 :] if n.get(role_key) == "agent"), None
-                )
-            )
-    return out
-
-
 def _latency_check(check, area: str, reported: list[Any], perceived: list[float]) -> None:
     if len(reported) != len(perceived) or None in reported:
         check(area, "a reply latency for every caller line", False, f"{reported} vs {perceived}")
@@ -487,10 +357,12 @@ def _wav_checks(check, area: str, wav_bytes: bytes, duration: float, truth: Grou
         channels, rate, frames = w.getnchannels(), w.getframerate(), w.readframes(w.getnframes())
     seconds = len(frames) / (2 * channels * rate)
     check(area, "WAV is stereo", channels == 2, channels)
+    # The recorder sits before the output transport, as 0.11's did: TTS audio a barge-in cut off is
+    # recorded too (about 1.5 s here), so the WAV runs a little past the call's wall-clock length
     check(
         area,
-        "WAV length matches call duration",
-        abs(seconds - duration) <= 1.0,
+        "WAV length within 2s of the call's",
+        abs(seconds - duration) <= 2.0,
         f"{seconds:.2f}s vs {duration:.2f}s",
     )
     if channels != 2:
@@ -523,11 +395,6 @@ def _same_lines(got: list[str], want: Expected) -> bool:
 def _repeats(texts: list[str]) -> list[str]:
     """Agent turns whose text repeats the end of the turn before."""
     return [b for a, b in zip(texts, texts[1:], strict=False) if b and a.endswith(b)]
-
-
-def _kind(processor: str) -> str:
-    name = processor.lower()
-    return next((k for k in ("stt", "llm", "tts") if k in name), name)
 
 
 def _diff(want: list[str], got: list[str]) -> str:

@@ -5,8 +5,8 @@ The scripted pipeline check (run.py) proves capture logic with stand-in services
 run swaps in the real ones: real streaming STT, real token streaming and usage,
 real word-timed TTS over a websocket, and Silero VAD deciding turns. The caller
 is recorded audio. Each service is wrapped to record what it reported to
-Pipecat (tokens, TTS text, STT seconds, tool calls); the observer's payload is
-checked against those records and against eval mode's payload for the same call.
+Pipecat (tokens, TTS text, STT seconds, tool calls); the call report attach()
+sends for the production call is checked against those records.
 
 Needs DEEPGRAM_API_KEY, OPENAI_API_KEY, CARTESIA_API_KEY (environment or
 --env-file) and pipecat-ai[deepgram,openai,cartesia,silero]. Not run in CI:
@@ -31,6 +31,7 @@ import tempfile
 import time
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ from pipecat.frames.frames import (  # noqa: E402
 )
 from pipecat.pipeline.pipeline import Pipeline  # noqa: E402
 from pipecat.pipeline.runner import PipelineRunner  # noqa: E402
+from pipecat.pipeline.task import PipelineParams, PipelineTask  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 from pipecat.processors.aggregators.llm_response_universal import (  # noqa: E402
     LLMContextAggregatorPair,
@@ -68,7 +70,7 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy  # noqa: E
 from pipecat.turns.user_turn_strategies import UserTurnStrategies  # noqa: E402
 from scripted_services import LocalMockTransport  # noqa: E402
 
-from superbryn_pipecat_observer import SuperbrynObserver, attach_test_data  # noqa: E402
+from superbryn_pipecat_observer import attach  # noqa: E402
 
 API_KEY = "sb_pipeline_check"
 AGENT_ID = "6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
@@ -150,7 +152,7 @@ class TappedCartesiaTTS(CartesiaTTSService):
         await super().start_tts_usage_metrics(text)
 
 
-# The observer names providers from the service's module, as it would the real class
+# The report names providers from the service's module, as it would the real class
 TappedDeepgramSTT.__module__ = DeepgramSTTService.__module__
 TappedOpenAILLM.__module__ = OpenAILLMService.__module__
 TappedCartesiaTTS.__module__ = CartesiaTTSService.__module__
@@ -304,21 +306,8 @@ async def run_call(keys: dict[str, str], barge_in: bool, dump: Path | None) -> l
             aggregators.assistant(),
         ]
     )
-    observer = SuperbrynObserver(
-        agent_id=AGENT_ID,
-        agent_name="real-services",
-        api_key=API_KEY,
-        webhook_url=catcher.webhook_url,
-        api_base_url=catcher.base_url,
-    )
-    task = observer.monitor_and_create_task(pipeline, transport=transport)
-    attach_test_data(
-        task,
-        api_key=API_KEY,
-        agent_id=AGENT_ID,
-        base_url=catcher.base_url,
-        superbryn_call_id="real-run",
-    )
+    task = PipelineTask(pipeline, params=PipelineParams())
+    attach(task, api_key=API_KEY, agent_id=AGENT_ID, base_url=catcher.base_url, call_id="real-run")
     await task.queue_frames([TTSSpeakFrame(GREETING)])
 
     try:
@@ -330,11 +319,7 @@ async def run_call(keys: dict[str, str], barge_in: bool, dump: Path | None) -> l
     if dump:
         dump.mkdir(parents=True, exist_ok=True)
         name = "barge_in" if barge_in else "normal"
-        out = {
-            "obs": catcher.caught.webhooks,
-            "evals": catcher.caught.test_events,
-            "truth": TRUTH.__dict__,
-        }
+        out = {"report": catcher.caught.events, "truth": TRUTH.__dict__}
         (dump / f"real_{name}.json").write_text(json.dumps(out, indent=2, default=str))
     return checks(catcher, barge_in, stt, tts)
 
@@ -348,16 +333,6 @@ def words(text: str) -> list[str]:
 
 def repeats(texts: list[str]) -> list[str]:
     return [b for a, b in zip(texts, texts[1:], strict=False) if b and a.endswith(b)]
-
-
-def first_reply_latencies(turns: list[dict], role: str, latency: str) -> list[Any]:
-    out = []
-    for i, t in enumerate(turns):
-        if t.get(role) == "user" and (i == 0 or turns[i - 1].get(role) != "user"):
-            out.append(
-                next((n.get(latency) for n in turns[i + 1 :] if n.get(role) == "agent"), None)
-            )
-    return out
 
 
 def checks(catcher: Catcher, barge_in: bool, stt: Any, tts: Any) -> list[Check]:
@@ -380,92 +355,108 @@ def checks(catcher: Catcher, barge_in: bool, stt: Any, tts: Any) -> list[Check]:
     )
     check("run", "LLM called lookup_order once", len(TRUTH.tool_calls) == 1, TRUTH.tool_calls)
 
-    check("obs", "exactly one webhook", len(caught.webhooks) == 1, len(caught.webhooks))
-    if not caught.webhooks:
+    kinds = [e.get("event") for e in caught.events]
+    check("report", "call.started then call.ended", kinds == ["call.started", "call.ended"], kinds)
+    ended = next((e for e in caught.events if e.get("event") == "call.ended"), None)
+    if ended is None:
         return result
-    call = caught.webhooks[0]["call"]
-    meta, usage = call["metadata"], call["usage"]
-    turns = call["transcript"]["turns"]
-    users = [t["text"] for t in turns if t["speaker"] == "user"]
-    agents = [t["text"] for t in turns if t["speaker"] == "agent"]
+    diag = ended.get("diagnostics") or {}
+    usage = diag.get("usage") or {}
+    turns = ended.get("transcript") or []
+    users = [t["text"] for t in turns if t["role"] == "user"]
+    agents = [t["text"] for t in turns if t["role"] == "agent"]
     spoken = words(" ".join(TRUTH.tts_texts))
+    check(
+        "report", "a production call", ended.get("surface") == "observability", ended.get("surface")
+    )
 
     check(
-        "obs", "user turns = Deepgram's final transcripts", words(" ".join(users)) == heard, users
+        "report",
+        "user turns = Deepgram's final transcripts",
+        words(" ".join(users)) == heard,
+        users,
     )
     if barge_in:
         got = words(" ".join(agents))
         check(
-            "obs",
+            "report",
             "agent text is words sent to TTS, cut-off part dropped",
             set(got) <= set(spoken) and len(got) < len(spoken),
             f"{len(got)} of {len(spoken)} words",
         )
-        flagged = [t for t in turns if t["speaker"] == "agent" and t.get("interrupted")]
-        check("obs", "one agent turn flagged interrupted", len(flagged) == 1, len(flagged))
     else:
         check(
-            "obs",
+            "report",
             "agent text = what Cartesia was asked to say",
             words(" ".join(agents)) == spoken,
             f"{agents} vs {TRUTH.tts_texts}",
         )
-    check("obs", "no duplicated agent text", not repeats(agents), repeats(agents))
+    flagged = [t for t in turns if t["role"] == "agent" and t.get("interrupted")]
+    check("report", "agent turns flagged interrupted = barge-ins", len(flagged) == TRUTH.barge_ins)
+    check("report", "no duplicated agent text", not repeats(agents), repeats(agents))
     numbers = set(re.findall(r"\d{4,}", " ".join(TRUTH.tts_texts)))
     check(
-        "obs",
+        "report",
         "numbers spoken whole stay whole",
         all(n in " ".join(agents) for n in numbers),
         numbers,
     )
 
-    replies = first_reply_latencies(turns, "speaker", "latency_ms")
+    latencies = diag.get("turn_latencies") or []
+    replies = [e.get("turn_ms") for e in latencies]
     if len(replies) == len(TRUTH.perceived_latency_ms) and None not in replies:
         gaps = [round(r - p) for r, p in zip(replies, TRUTH.perceived_latency_ms, strict=True)]
         check(
-            "obs",
+            "report",
             f"reply latency within {LATENCY_TOLERANCE_MS}ms of what the caller waited",
             all(abs(g) <= LATENCY_TOLERANCE_MS for g in gaps),
             f"reported {replies} vs waited {TRUTH.perceived_latency_ms}",
         )
     else:
         check(
-            "obs",
+            "report",
             "a reply latency per caller line",
             False,
             f"{replies} vs {TRUTH.perceived_latency_ms}",
         )
+    check(
+        "report",
+        "STT, LLM and TTS time per reply",
+        latencies and all({"transcriber_ms", "model_ms", "voice_ms"} <= set(e) for e in latencies),
+        latencies,
+    )
 
     check(
-        "obs",
+        "report",
         "LLM input tokens = OpenAI usage",
-        usage["llm_input_tokens"] == TRUTH.prompt_tokens,
-        f"{usage['llm_input_tokens']} vs {TRUTH.prompt_tokens}",
+        usage.get("llm_input_tokens") == TRUTH.prompt_tokens,
+        f"{usage.get('llm_input_tokens')} vs {TRUTH.prompt_tokens}",
     )
     check(
-        "obs",
+        "report",
         "LLM output tokens = OpenAI usage",
-        usage["llm_output_tokens"] == TRUTH.completion_tokens,
-        f"{usage['llm_output_tokens']} vs {TRUTH.completion_tokens}",
+        usage.get("llm_output_tokens") == TRUTH.completion_tokens,
+        f"{usage.get('llm_output_tokens')} vs {TRUTH.completion_tokens}",
     )
     tts_chars = sum(map(len, TRUTH.tts_texts))
     check(
-        "obs",
+        "report",
         "TTS characters = text sent to Cartesia",
-        usage["tts_characters"] == tts_chars,
-        f"{usage['tts_characters']} vs {tts_chars}",
+        usage.get("tts_characters") == tts_chars,
+        f"{usage.get('tts_characters')} vs {tts_chars}",
     )
     if TRUTH.stt_reported:
+        stt_seconds = (usage.get("stt_audio_ms") or 0) / 1000
         check(
-            "obs",
+            "report",
             "STT seconds = Deepgram usage",
-            abs(usage["stt_duration_seconds"] - TRUTH.stt_seconds) < 0.05,
-            f"{usage['stt_duration_seconds']} vs {TRUTH.stt_seconds:.2f}",
+            abs(stt_seconds - TRUTH.stt_seconds) < 0.05,
+            f"{stt_seconds} vs {TRUTH.stt_seconds:.2f}",
         )
 
-    sent = call.get("tool_calls") or []
+    sent = ended.get("tool_calls") or []
     check(
-        "obs",
+        "report",
         "one record per tool call",
         len(sent) == len(TRUTH.tool_calls),
         f"{len(sent)} vs {len(TRUTH.tool_calls)}",
@@ -473,114 +464,51 @@ def checks(catcher: Catcher, barge_in: bool, stt: Any, tts: Any) -> list[Check]:
     if sent and TRUTH.tool_calls:
         want = TRUTH.tool_calls[0]
         check(
-            "obs",
+            "report",
             "tool arguments and result",
             sent[0]["arguments"] == want["arguments"]
             and sent[0].get("result") == want.get("result"),
             sent[0],
         )
 
+    config = diag.get("configuration") or {}
     expected = {
-        "transport": "localmock",
-        "llm_provider": "openai",
-        "llm_model": LLM_MODEL,
-        "stt_provider": "deepgram",
-        "stt_model": stt._settings.model,
-        "tts_provider": "cartesia",
-        "tts_model": tts._settings.model,
-        "tts_voice_id": VOICE_ID,
+        "stt": {"provider": "deepgram", "model": stt._settings.model},
+        "llm": {"provider": "openai", "model": LLM_MODEL},
+        "tts": {"provider": "cartesia", "model": tts._settings.model, "voice": VOICE_ID},
     }
-    wrong = {k: meta.get(k) for k, v in expected.items() if meta.get(k) != v}
-    check("obs", "transport, providers, models, voice", not wrong, wrong or expected)
-    section = call["interruptions"]
-    # interruption_count is every interruption Pipecat broadcast (one per caller turn start);
-    # bot_turns_interrupted is the caller actually cutting the bot off
+    got = {
+        role: {k: (config.get(role) or {}).get(k) for k in want} for role, want in expected.items()
+    }
+    check("report", "providers, models, voice", got == expected, got)
+    environment = (ended.get("context") or {}).get("environment") or {}
+    check("report", "transport named", environment.get("transport") == "localmock", environment)
     check(
-        "obs",
-        "bot turns interrupted = barge-ins",
-        section["bot_turns_interrupted"] == TRUTH.barge_ins,
-        section,
-    )
-    check(
-        "obs",
-        "at most one interruption per caller line",
-        section["interruption_count"] <= len(CALLER_LINES),
-        section,
-    )
-    timings = call["latency"].get("by_service") or {}
-    check(
-        "obs",
-        "TTFB for STT, LLM and TTS",
-        all(
-            any(k in name.lower() and "avg_ttfb_ms" in v for name, v in timings.items())
-            for k in ("stt", "llm", "tts")
-        ),
-        sorted(timings),
-    )
-    check(
-        "obs",
+        "report",
         "loguru line from the tool captured",
-        LOG_LINE in [e["message"] for e in call.get("logs") or []],
-        len(call.get("logs") or []),
+        LOG_LINE in [e["message"] for e in diag.get("logs") or []],
+        len(diag.get("logs") or []),
     )
+    observability = ended.get("observability") or {}
     check(
-        "obs",
+        "report",
         "stereo recording uploaded",
-        len(caught.uploads) == 1 and call.get("stereo_recording_url"),
-        call.get("stereo_recording_url"),
+        len(caught.uploads) == 1 and observability.get("stereo_recording_url"),
+        observability,
     )
+    started, finished = (
+        datetime.fromisoformat(ended[k].replace("Z", "+00:00")) for k in ("started_at", "ended_at")
+    )
+    call_seconds = (finished - started).total_seconds()
     for wav_bytes in list(caught.uploads.values())[:1]:
         with wave.open(io.BytesIO(wav_bytes)) as w:
             seconds = w.getnframes() / w.getframerate()
         check(
-            "obs",
+            "report",
             "recording length matches the call",
-            abs(seconds - call["duration_seconds"]) <= 1.0,
-            f"{seconds:.1f}s vs {call['duration_seconds']:.1f}s",
+            abs(seconds - call_seconds) <= 1.0,
+            f"{seconds:.1f}s vs {call_seconds:.1f}s",
         )
-
-    # Eval mode reads the same call independently; the two should agree
-    ended = next((e for e in caught.test_events if e.get("event") == "call.ended"), None)
-    check("evals", "call.ended sent", ended is not None)
-    if ended is None:
-        return result
-    e_turns = ended.get("transcript") or []
-    e_usage = (ended.get("diagnostics") or {}).get("usage") or {}
-    e_agents = [t["text"] for t in e_turns if t["role"] == "agent"]
-    check(
-        "evals",
-        "same agent text as obs",
-        words(" ".join(e_agents)) == words(" ".join(agents)),
-        f"{e_agents} vs {agents}",
-    )
-    check(
-        "evals",
-        "same caller text as obs",
-        words(" ".join(t["text"] for t in e_turns if t["role"] == "user"))
-        == words(" ".join(users)),
-    )
-    check(
-        "evals",
-        "same tokens and TTS chars as obs",
-        (
-            e_usage.get("llm_input_tokens"),
-            e_usage.get("llm_output_tokens"),
-            e_usage.get("tts_characters"),
-        )
-        == (usage["llm_input_tokens"], usage["llm_output_tokens"], usage["tts_characters"]),
-        e_usage,
-    )
-    check("evals", "same tool calls as obs", len(ended.get("tool_calls") or []) == len(sent))
-    e_lat = [
-        e.get("turnLatency") for e in (ended.get("diagnostics") or {}).get("turn_latencies") or []
-    ]
-    check(
-        "evals",
-        "turn latencies within 150ms of obs",
-        len(e_lat) == len(replies)
-        and all(r is not None and abs(a - r) <= 150 for a, r in zip(e_lat, replies, strict=False)),
-        f"evals {e_lat} vs obs {replies}",
-    )
     return result
 
 

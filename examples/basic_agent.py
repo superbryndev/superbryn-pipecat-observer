@@ -1,33 +1,32 @@
 """
-Minimal Pipecat agent wired with SuperbrynObserver.
+Minimal Pipecat agent reported to SuperBryn with one attach() call.
 
 Run with:
-    export SUPERBRYN_API_KEY="sb_live_..."
-    export SUPERBRYN_WEBHOOK_URL="https://api.superbryn.com/webhooks/obs/pipecat"
+    export SUPERBRYN_API_KEY="sbryn_..."   # one key with test_data:write and obs:write
+    export SUPERBRYN_AGENT_ID="..."        # the agent's SuperBryn ID (not needed with an agent key)
     export OPENAI_API_KEY="..."
     export DEEPGRAM_API_KEY="..."
     export CARTESIA_API_KEY="..."
-    python examples/basic_agent.py
 
-The observer captures audio in-pipeline (transport-agnostic), uploads
-the WAV directly to S3 via a presigned PUT URL fetched from the
-SuperBryn API, then POSTs the call payload to the webhook URL when
-the session ends. No carrier credentials required.
+`bot(runner_args)` is the entry point Pipecat's runner calls for each call. A SuperBryn test call is
+reported for testing; every other call as a production call, recorded in stereo in the pipeline and
+uploaded straight to S3. No carrier credentials required.
 """
 
 import os
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketTransport
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport
 
-from superbryn_pipecat_observer import SuperbrynObserver
+from superbryn_pipecat_observer import attach
 
 
-async def main(transport: FastAPIWebsocketTransport) -> None:
+async def run_bot(transport: FastAPIWebsocketTransport, runner_args) -> None:
     pipeline = Pipeline(
         [
             transport.input(),
@@ -43,15 +42,14 @@ async def main(transport: FastAPIWebsocketTransport) -> None:
             transport.output(),
         ]
     )
+    task = PipelineTask(pipeline, params=PipelineParams())
 
-    observer = SuperbrynObserver(
-        agent_id=os.environ.get("SUPERBRYN_AGENT_ID", "basic-pipecat-bot"),
-        agent_name="basic-pipecat-bot",
-    )
+    # once per call, after the task is built and before it runs
+    report = attach(task, runner_args, custom_data={"agent_name": "basic-pipecat-bot"})
 
-    task = observer.monitor_and_create_task(
-        pipeline,
-        transport=transport,
-    )
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(_transport, _client):
+        report.update_custom_data({"hung_up_by_caller": True})
+        await task.cancel()
 
     await PipelineRunner().run(task)

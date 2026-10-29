@@ -42,7 +42,7 @@ jobs:
         run: pytest -q
 
   pipeline-check:
-    # A scripted call through a real Pipecat pipeline, both SDK paths attached,
+    # A scripted call through a real Pipecat pipeline with attach(),
     # every payload field checked against what actually happened. Catches
     # capture bugs fakes can't (a frame counted once per pipeline hop, say).
     name: Pipeline check
@@ -107,12 +107,11 @@ jobs:
           /tmp/verify-env/bin/pip install --upgrade pip
           /tmp/verify-env/bin/pip install dist/*.whl
           /tmp/verify-env/bin/python -c "
-          from superbryn_pipecat_observer import SuperbrynObserver, __version__
+          from superbryn_pipecat_observer import CallReport, __version__, attach
           print('version:', __version__)
-          obs = SuperbrynObserver(agent_name='ci-check', api_key='dummy')
-          payload = obs._build_payload()
-          assert payload['event'] == 'call.completed'
-          assert payload['call']['metadata']['agent_name'] == 'ci-check'
+          report = attach(object(), api_key='')  # no key: a no-op handle, nothing sent
+          assert isinstance(report, CallReport)
+          report.set_custom_data({'workflow_id': 'ci-check'})
           print('wheel install OK')
           "
 

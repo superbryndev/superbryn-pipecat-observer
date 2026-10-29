@@ -1,4 +1,4 @@
-"""Shared fakes for manifest-extraction tests.
+"""Shared fakes for manifest-extraction tests, and a guard that keeps every test off the network.
 
 Pipecat services are simulated by setting ``__module__`` on fake classes to
 ``pipecat.services.<provider>.<role>`` — that is what extraction keys on, so
@@ -7,7 +7,32 @@ tests don't need live service instances (which require API keys).
 
 from __future__ import annotations
 
+import socket
 from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """No test reaches a network: anything that would is a bug in the test's stubs."""
+
+    local = ("127.0.0.1", "::1", "localhost")
+
+    def refuse(sock, address, *args):
+        if not isinstance(address, tuple) or address[0] in local:  # a Unix socket, or this machine
+            return real_connect(sock, address)
+        raise AssertionError(f"network access attempted: {address}")
+
+    def resolve(host, *args, **kwargs):
+        if host in local or host is None:
+            return real_resolve(host, *args, **kwargs)
+        raise AssertionError(f"DNS lookup attempted: {host}")
+
+    real_connect, real_resolve = socket.socket.connect, socket.getaddrinfo
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
 
 
 def make_service(provider: str, role: str, **attrs):

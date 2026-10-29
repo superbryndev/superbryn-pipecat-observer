@@ -4,7 +4,7 @@ Agent config sync for superbryn-pipecat-observer (opt-in).
 Builds a SuperBryn AgentSyncManifest from a running Pipecat pipeline and
 pushes it to ``POST {api_base}/public-api/v1/agents/me/sync``. Nothing here
 runs unless the customer explicitly calls ``sync_config`` /
-``async_sync_config`` — attaching the observer alone never syncs.
+``async_sync_config`` — attach() alone never syncs.
 
 Requires an **agent-scoped** API key (created against a single agent in the
 SuperBryn dashboard); org-scoped keys are rejected by the endpoint. The
@@ -27,9 +27,9 @@ import urllib.request
 from typing import Any, Literal, TypedDict
 
 from ._provider_detect import detect_provider_from_model
-from .config import WEBHOOK_CONFIG
+from .config import API_CONFIG
 
-logger = logging.getLogger("superbryn.pipecat.sync")
+logger = logging.getLogger("superbryn_pipecat_observer.config_sync")
 
 SYNC_PATH = "/public-api/v1/agents/me/sync"
 
@@ -138,7 +138,7 @@ def _validate_config_sections(
             _check_keys("telephony.ivr_config", telephony.get("ivr_config"), _IVR_KEYS)
 
 
-# Keep in lock-step with SuperbrynObserver._MODULE_PROVIDER_MAP.
+# Provider names by Pipecat service module.
 _MODULE_PROVIDER_MAP: dict[str, str] = {
     "anthropic": "anthropic",
     "openai": "openai",
@@ -580,10 +580,10 @@ def build_manifest_from_pipeline(
 
 
 def _resolve_endpoint(base_url: str | None) -> str:
-    base = (base_url or WEBHOOK_CONFIG.get("api_base_url") or "").rstrip("/")
+    base = (base_url or API_CONFIG.get("api_base_url") or "").rstrip("/")
     if not base:
         raise ValueError(
-            "SuperBryn API base URL is not configured — set SUPERBRYN_API_BASE_URL "
+            "SuperBryn API base URL is not configured — set SUPERBRYN_BASE_URL "
             "or pass base_url= to sync_config()"
         )
     return base + SYNC_PATH
@@ -604,7 +604,7 @@ def sync_manifest(
     ``change_types``. Raises on transport errors and non-2xx responses so
     deploy pipelines fail loudly.
     """
-    key = api_key or WEBHOOK_CONFIG.get("api_key") or ""
+    key = api_key or API_CONFIG.get("api_key") or ""
     if not key:
         raise ValueError("SuperBryn API key missing — set SUPERBRYN_API_KEY or pass api_key=")
 
@@ -658,9 +658,9 @@ async def async_sync_config(
     **manifest_overrides: Any,
 ) -> dict[str, Any]:
     """Async variant of :func:`sync_config` using aiohttp."""
-    import aiohttp  # lazy — matches the observer's send path
+    import aiohttp  # lazy, as the call report sends
 
-    key = api_key or WEBHOOK_CONFIG.get("api_key") or ""
+    key = api_key or API_CONFIG.get("api_key") or ""
     if not key:
         raise ValueError("SuperBryn API key missing — set SUPERBRYN_API_KEY or pass api_key=")
 

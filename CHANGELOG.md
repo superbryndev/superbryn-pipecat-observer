@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-29
+
+One entry point and one report per call. `attach(task, runner_args)` replaces both 0.11 paths (`SuperbrynObserver`
+with `monitor_and_create_task` / `simulate_and_create_task` for production calls, and `attach_test_data` for
+SuperBryn test calls) and posts one body to `/public-api/v1/calls/agent-data`. This is a breaking change: see
+"Upgrading from 0.11" below and in the README.
+
+### Added
+- `attach(task, runner_args=None, *, api_key, agent_id, production=True, record=True, simulation=False,
+  capture_logs=True, custom_data, prompt, prompt_version, base_url, superbryn_call_id, from_number, to_number,
+  call_id, call_data)`, called once per call after the `PipelineTask` is built and before it runs; it adds its own
+  observer and `on_pipeline_finished` hook and returns the call's handle: `set_custom_data()`,
+  `update_custom_data()`, `set_call_end_reason()` and `set_recording_url()`.
+- A `surface` per call: a SuperBryn test call (recognised as 0.11's `attach_test_data` did: `superbryn_call_id`
+  passed, in the start body, a Daily dial-in SIP header, a telephony custom parameter, or SuperBryn's caller number)
+  is `testing`; every other call is `observability`, unless `production=False`, which sends nothing for it. Each
+  call is reported once, as `call.started` and `call.ended`, with 0.11's retries and the same `event_id` on each.
+- Production calls keep 0.11's in-pipeline stereo recording (the caller left, the agent right, uploaded through a
+  presigned URL); `attach` inserts the recorder before the output transport itself. They send
+  `observability.recording_url`, `stereo_recording_url`, `recording_url_source`, `mode` (`observe`, or `track` with
+  `simulation=True`, in place of `simulate_and_create_task`) and, on Daily dial-in / dial-out, `direction`.
+  `record=False` sends no recording; `set_recording_url()` sends your own (`recording_url_source: "external"`). Test
+  calls are not recorded.
+- Both surfaces: `ended_by` (`agent`, `caller` or `system`, when known); `diagnostics.dtmf[]`; `context` with
+  `system_prompt`, `prompt_ref`, `room_url` and `environment` (`pipecat_observer_version`, `pipecat_version`,
+  `python_version`, `transport`, `pipeline_version`); `custom_data` at the top level, exactly as given; tool calls
+  an LLM was prompted to write as `<tool_use>` blocks (0.11 did this for production calls only).
+- Production calls: the session's log lines as `diagnostics.logs[]` (`capture_logs=True`, as 0.11 sent `call.logs`),
+  now only the lines this call's own code wrote, each cut to 2,000 characters; the root logger's level is no longer
+  raised to INFO, so `logging` lines come at the levels your config lets through.
+
+### Changed
+- Turn latency keys are snake_case: `turn_latencies[]` has `turn_id`, `transcriber_ms`, `endpointing_ms`,
+  `model_ms`, `voice_ms` and `turn_ms` (was `transcriberLatency`, `endpointingLatency`, `modelLatency`,
+  `voiceLatency`, `turnLatency`). `superbryn_call_id` moves into the `testing` block.
+- A production call's `call_id` is what 0.11 named it in Monitor: `call_id=` (0.11's `session_id=`), else
+  `runner_args.session_id`, else a random UUID. A test call's stays the telephony call's ID, as 0.11's eval mode sent.
+- `ended_reason` is `ended`, `cancelled`, `stopped` or `error` on both surfaces (0.11's production calls said
+  `completed` or `cancelled`); `set_call_end_reason()` overrides it.
+- One key: `SUPERBRYN_API_KEY` with both `test_data:write` and `obs:write`. `SUPERBRYN_AGENT_ID` (a UUID) is sent
+  when set and optional with an agent key; any other value is left out with one warning instead of disabling
+  reporting. `SUPERBRYN_BASE_URL` is the API origin, for config sync too. Log lines start with
+  `SUPERBRYN_CALL_REPORT_` (logger `superbryn_pipecat_observer.call_report`).
+- A production call that ends while SuperBryn's caller numbers are being fetched waits for them (within the
+  12-second budget) instead of sending nothing.
+- Fewer requests per call: SuperBryn's caller numbers and the prompt versions already pushed are kept per key in a
+  temp file every process on the host reads (numbers for an hour, prompts for a day), so a new process per call no
+  longer asks each time; a key refused the numbers is asked again after an hour, not a minute (an outage still
+  after a minute).
+- Any valid SuperBryn API key reads the caller numbers and sends production calls (as the Monitor webhooks took
+  any key), so keys made before `obs:write` existed keep working; a test call's data still needs `test_data:write`,
+  and without it SuperBryn's phone tests are recognised and kept out of Monitor.
+- Tested on Pipecat 1.4 through 1.14 (CI runs the latest). `ended_by` is `caller` on LiveKit rooms too: a transport without
+  `on_client_disconnected` is heard through `on_participant_left`. An error counts as fatal (`ended_reason`
+  `error`, `ended_by` `system`) when it is marked fatal, or its processor can no longer do its job (Pipecat 1.8+'s
+  `push_error(..., force_treat_as_permanent=True)`) and the task's `processor_unusable_policy` is `END` or
+  `CANCEL`; under the default, `CONTINUE`, the call goes on (a `ServiceSwitcher` fails over). The deprecated `fatal`
+  field is not read directly. A caller hanging up is heard on SmallWebRTC, Tavus, HeyGen and LemonSlice too,
+  whose inputs and outputs keep only the transport's client. The handle's setters never raise: `custom_data` takes
+  any mapping, as 0.11 did, and a value a setter can't take is left out with a warning. Prompt pushes name the
+  agent (`SUPERBRYN_AGENT_ID`), so an organization key can push them, and a refused push is tried again after an
+  hour instead of on every call. A slow prompt push no longer holds the end of the call. The `prompt_sync` and
+  `config_sync` loggers are now `superbryn_pipecat_observer.prompt_sync` and `.config_sync` (they were
+  `superbryn.pipecat.*`).
+  `ToolsSchema` comes from its Pipecat 1.14 module, and an `attach()` after the task started no longer inserts
+  the recorder on Pipecat 1.14.
+
+### Removed
+- `SuperbrynObserver` (with `monitor_*`, `simulate_*`, the deprecated `observe_*` / `track_*`,
+  `register_task_handlers`, `attach_to_task`, `set_custom_metadata`, `defer_upload` / `start_audio_upload()` /
+  `abort()`), `SuperbrynAudioRecorder` as public API, `attach_test_data`, the 0.11 `call.completed` body and its route
+  (`/webhooks/obs/pipecat`), and the `SUPERBRYN_TEST_API_KEY`, `SUPERBRYN_WEBHOOK_URL`, `WEBHOOK_URL`, `AGENT_ID` and
+  `VERSION_ID` settings. `SUPERBRYN_OBSERVER_ENABLED` still turns reporting off.
+- Numbers the package worked out: `latency.avg_ms` / `p95_ms` and the per-service timing averages,
+  `speech_stats`, the turn-detection, interruption, VAD, connection, SIP and pipeline sections, `duration_seconds`,
+  and the token breakdown beyond input, cached input and output. SuperBryn computes what it needs from the raw
+  records.
+- `examples/synthetic_call.py`; `examples/pipeline_check/run.py --dump` writes the bodies a real pipeline sends.
+
+### Upgrading from 0.11
+Build the `PipelineTask` yourself and call `report = attach(task, runner_args, custom_data=...)` before it runs, in
+place of `SuperbrynObserver(...)` + `monitor_and_create_task(...)` and `attach_test_data(...)`, with the same
+`custom_metadata` keys and value types in `custom_data` (and `agent_name` there too); `simulate_and_create_task` is
+`simulation=True`; call `report.update_custom_data()` where you called `set_custom_metadata()`. Put SuperBryn's
+Agent data key (both permissions) in `SUPERBRYN_API_KEY` and remove `SUPERBRYN_TEST_API_KEY`, set `SUPERBRYN_AGENT_ID` to the
+agent's SuperBryn ID instead of a free-form `AGENT_ID`, replace `SUPERBRYN_WEBHOOK_URL` with `SUPERBRYN_BASE_URL`,
+and pin `superbryn-pipecat-observer>=0.12.0`. The README has a before/after and a prompt that has a coding agent make
+the change.
+
 ## [0.11.1] - 2026-10-27
 
 Found by end-to-end calls with real services (Gemini Live, Nova Sonic, and a Deepgram + Gemini + Deepgram cascade), each reply latency checked against how long the scripted caller actually waited.

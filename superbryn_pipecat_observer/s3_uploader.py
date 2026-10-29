@@ -1,5 +1,5 @@
 """
-Direct-to-S3 audio upload for SuperbrynObserver.
+Direct-to-S3 upload of a production call's recording.
 
 Two-step flow (orchestration is never on the audio data path):
 
@@ -19,9 +19,8 @@ uploads (see ``generatePresignedUploadUrl`` in
 
 Failure handling: every step is best-effort. If the presign endpoint is
 unreachable or the PUT fails, we log and return ``None`` so the
-observer falls back to a JSON-only webhook *without* an audio URL. The
-call record still lands; only the recording link is missing on the
-dashboard.
+report is sent *without* a recording URL. The call still lands; only
+the recording link is missing on the dashboard.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ async def fetch_recording_upload_url(
     ``object_key``, ``public_url`` — or ``None`` on any error.
     """
     try:
-        import aiohttp  # lazy: matches the import discipline in observer.py
+        import aiohttp  # lazy
     except ImportError:
         logger.error("SUPERBRYN_PIPECAT_S3_NO_AIOHTTP: install aiohttp to enable direct S3 upload")
         return None
