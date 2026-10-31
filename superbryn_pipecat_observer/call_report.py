@@ -1700,10 +1700,14 @@ async def _send(
 
 def _refusal_hint(status: int, answer: Any) -> str:
     """What to change when SuperBryn refused a report."""
-    if isinstance(answer, dict) and answer.get("code") == "agent_id_required":
+    error = answer.get("error") if isinstance(answer, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if code == "agent_id_required":
         return (
             " (set SUPERBRYN_AGENT_ID to the agent's SuperBryn ID, or use the agent's own API key)"
         )
+    if code in ("agent_key_mismatch", "agent_outside_project"):
+        return " (SUPERBRYN_AGENT_ID is not this key's agent, or not in the key's organization)"
     if status in (401, 403):
         return " (a SuperBryn test call needs a key with test_data:write; check the key is valid)"
     return ""

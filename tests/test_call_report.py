@@ -1756,11 +1756,24 @@ async def test_a_refused_call_started_sends_no_call_ended(clock, http, caplog):
 
 
 async def test_a_missing_agent_id_names_the_fix(clock, http, caplog):
-    http.replies = [(400, {"code": "agent_id_required"})]
+    # The server's error shape: {"error": {"code", "message"}}.
+    http.replies = [
+        (400, {"error": {"code": "agent_id_required", "message": "agent_id is required"}})
+    ]
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         await Call(clock, agent_id=None, superbryn_call_id="sb").start()
     [rejected] = messages(caplog, "REJECTED")
     assert "set SUPERBRYN_AGENT_ID" in rejected
+
+
+async def test_another_agents_id_names_the_fix(clock, http, caplog):
+    http.replies = [
+        (403, {"error": {"code": "agent_key_mismatch", "message": "not this key's agent"}})
+    ]
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        await Call(clock, agent_id="a", superbryn_call_id="sb").start()
+    [rejected] = messages(caplog, "REJECTED")
+    assert "is not this key's agent" in rejected
 
 
 async def test_gives_up_after_three_attempts_and_still_sends_ended(clock, http):
