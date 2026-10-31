@@ -1,11 +1,9 @@
 """
-superbryn-pipecat-observer
-
-Drop-in Pipecat observer that reports a normalized call record to SuperBryn
-at end of session. See README.md for usage.
+superbryn-pipecat-observer: one call, attach(task, runner_args), reports each call of a Pipecat agent to SuperBryn.
+See README.md for usage.
 """
 
-from .audio_recorder import SuperbrynAudioRecorder
+from .call_report import CallReport, attach
 from .config_sync import (
     BehaviorConfig,
     IdentityConfig,
@@ -17,21 +15,19 @@ from .config_sync import (
     sync_config,
     sync_manifest,
 )
-from .observer import SuperbrynObserver, __version__
 from .prompt_sync import prompt_hash, prompt_ref, push_prompt
-from .test_data import attach_test_data
 
+__version__ = "0.12.0"
 __all__ = [
     "BehaviorConfig",
+    "CallReport",
     "IdentityConfig",
     "LanguageConfig",
-    "SuperbrynAudioRecorder",
-    "SuperbrynObserver",
     "TelephonyConfig",
     "ToolConfig",
     "__version__",
     "async_sync_config",
-    "attach_test_data",
+    "attach",
     "build_manifest_from_pipeline",
     "prompt_hash",
     "prompt_ref",

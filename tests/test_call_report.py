@@ -1,13 +1,17 @@
-"""Eval mode (test_data.py) driven with real Pipecat frames, metrics and service base classes."""
+"""attach() (call_report.py) driven with real Pipecat frames, metrics and service base classes."""
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
+import os
+import tempfile
 import time
 import warnings
+import wave
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -15,8 +19,10 @@ from typing import Any
 
 import numpy as np
 import pytest
+from loguru import logger as loguru_logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
@@ -24,17 +30,20 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
+    EndWorkerFrame,
     ErrorFrame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallResultProperties,
     InputAudioRawFrame,
+    InputDTMFFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
     MetricsFrame,
+    OutputAudioRawFrame,
     SpeechControlParamsFrame,
     StartFrame,
     StopFrame,
@@ -64,18 +73,19 @@ from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings, STTSettings, TTSSettings
 from pipecat.services.stt_service import SegmentedSTTService, STTService
 from pipecat.services.tts_service import TTSService
+from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
-from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.turns.user_start import MinWordsUserTurnStartStrategy, VADUserTurnStartStrategy
 from pydantic import BaseModel, ConfigDict, Field
 
-import superbryn_pipecat_observer.test_data as td
-from superbryn_pipecat_observer import attach_test_data
+import superbryn_pipecat_observer.call_report as cr
+from superbryn_pipecat_observer import attach
 
 T0 = 1_800_000_000.0  # 2027-01-15T08:00:00Z
 AGENT_ID = "4347a69f-0c1e-4b6a-9f1e-2b3c4d5e6f70"
 UP = FrameDirection.UPSTREAM
-LOGGER = "superbryn_pipecat_observer.test_data"
+LOGGER = "superbryn_pipecat_observer.call_report"
 
 
 # ── fakes: real Pipecat base classes, so the isinstance checks are real ──
@@ -191,7 +201,7 @@ class FakeHTTP:
 
 
 class FakeTask:
-    """The three things attach_test_data uses on a PipelineTask."""
+    """The three things attach uses on a PipelineTask."""
 
     def __init__(self, *, metrics: bool = True) -> None:
         self.params = PipelineParams(enable_metrics=metrics, enable_usage_metrics=metrics)
@@ -221,7 +231,9 @@ class Call:
         self.task = FakeTask()
         kwargs.setdefault("api_key", "sk_test")
         kwargs.setdefault("agent_id", AGENT_ID)
-        attach_test_data(self.task, runner_args, **kwargs)
+        # SuperBryn test calls unless a test says otherwise: other calls send nothing
+        kwargs.setdefault("production", False)
+        self.report = attach(self.task, runner_args, **kwargs)
         self.observer = self.task.observers[0] if self.task.observers else None
 
     async def start(self) -> Call:
@@ -248,31 +260,47 @@ class Call:
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch):
+def _isolated(monkeypatch, tmp_path):
     for name in (
         "SUPERBRYN_TEST_API_KEY",
         "SUPERBRYN_API_KEY",
         "SUPERBRYN_AGENT_ID",
         "SUPERBRYN_BASE_URL",
+        "SUPERBRYN_OBSERVER_ENABLED",
     ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(td, "_BACKOFF_S", (0.0, 0.0))
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 0.05)
-    td._caller_numbers_cache.clear()
-    td._warned.clear()
+    monkeypatch.setattr(cr, "_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))  # this test's caller-number file only
+    cr._caller_numbers_cache.clear()
+    cr._warned.clear()
+    cr._attached_tasks.clear()
+
+
+@pytest.fixture(autouse=True)
+def pushes(monkeypatch) -> list[dict[str, Any]]:
+    """push_prompt stand-in: the prompt pushes made, never sent."""
+    made: list[dict[str, Any]] = []
+
+    async def push(**kwargs: Any) -> bool:
+        made.append(kwargs)
+        return True
+
+    monkeypatch.setattr(cr, "push_prompt", push)
+    return made
 
 
 @pytest.fixture(autouse=True)
 def http(monkeypatch) -> FakeHTTP:
     fake = FakeHTTP()
-    monkeypatch.setattr(td, "_http_request", fake)
+    monkeypatch.setattr(cr, "_http_request", fake)
     return fake
 
 
 @pytest.fixture
 def clock(monkeypatch) -> Clock:
     c = Clock()
-    monkeypatch.setattr(td, "_now", lambda: c.t)
+    monkeypatch.setattr(cr, "_now", lambda: c.t)
     return c
 
 
@@ -363,7 +391,7 @@ async def test_explicit_test_id_sends_started_and_ended(clock, http):
     await call.end(at=5)
     assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]
     assert http.gets() == []
-    assert http.events("started")[0]["superbryn_call_id"] == "sb-1"
+    assert http.events("started")[0]["testing"]["superbryn_call_id"] == "sb-1"
 
 
 @pytest.mark.parametrize(
@@ -373,7 +401,7 @@ async def test_explicit_test_id_sends_started_and_ended(clock, http):
 )
 async def test_test_id_from_start_body(clock, http, body):
     await Call(clock, SimpleNamespace(body=body)).start()
-    assert http.events("started")[0]["superbryn_call_id"] == "sb-body"
+    assert http.events("started")[0]["testing"]["superbryn_call_id"] == "sb-body"
 
 
 @pytest.mark.parametrize(
@@ -393,7 +421,7 @@ async def test_test_id_from_daily_dialin_sip_headers(clock, http, header, as_mod
         body = DialinRequestModel.model_validate(body)
     await Call(clock, SimpleNamespace(body=body)).start()
     started = http.events("started")[0]
-    assert started["superbryn_call_id"] == "sb-sip"
+    assert started["testing"]["superbryn_call_id"] == "sb-sip"
     assert (started["from"], started["to"], started["call_id"]) == (
         "+14155550999",
         "+14155550123",
@@ -416,7 +444,7 @@ async def test_test_id_from_daily_dialin_sip_headers(clock, http, header, as_mod
 async def test_test_id_from_telephony_call_data(clock, http, call_data):
     await Call(clock, SimpleNamespace(call_data=call_data)).start()
     started = http.events("started")[0]
-    assert (started["superbryn_call_id"], started["call_id"]) == ("sb-tw", "CA1")
+    assert (started["testing"]["superbryn_call_id"], started["call_id"]) == ("sb-tw", "CA1")
 
 
 async def test_handshake_the_bot_parsed_itself(clock, http):
@@ -435,7 +463,7 @@ async def test_handshake_the_bot_parsed_itself(clock, http):
     websocket._pipecat_parsed_telephony = ("twilio", handshake)
     await Call(clock, SimpleNamespace(websocket=websocket, call_data=None)).start()
     started = http.events("started")[0]
-    assert (started["superbryn_call_id"], started["call_id"]) == ("sbc_123", "CA1")
+    assert (started["testing"]["superbryn_call_id"], started["call_id"]) == ("sbc_123", "CA1")
     assert (started["from"], started["to"]) == ("+14155550100", "+16505550199")
 
 
@@ -444,7 +472,7 @@ async def test_call_data_argument_comes_first(clock, http):
     args = SimpleNamespace(call_data=CallDataModel(call_id="CA1"))
     await Call(clock, args, call_data=handshake).start()
     started = http.events("started")[0]
-    assert (started["superbryn_call_id"], started["call_id"]) == ("sb-arg", "CA2")
+    assert (started["testing"]["superbryn_call_id"], started["call_id"]) == ("sb-arg", "CA2")
 
 
 async def test_nothing_to_recognise_is_logged_once_at_info(clock, http, caplog):
@@ -468,7 +496,7 @@ async def test_unfilled_template_placeholders_are_ignored(clock, http, caplog):
     started = http.events("started")[0]
     assert not {"superbryn_call_id", "from"} & started.keys() and started["to"] == "+14155550100"
     assert messages(caplog, "placeholders") == [
-        "SUPERBRYN_TEST_DATA: ignored unfilled template placeholders "
+        "SUPERBRYN_CALL_REPORT: ignored unfilled template placeholders "
         "{'superbryn_call_id': '{SipHeader_X-SuperBryn-Call-Id}', 'from': '{From}'}"
     ]
 
@@ -478,14 +506,14 @@ async def test_caller_number_fallback_matches_and_caches(clock, http):
     args = SimpleNamespace(call_data=CallDataModel(**{"from": "14155550100", "to": "+15550001"}))
     await Call(clock, args).start()
     started = http.events("started")[0]
-    assert "superbryn_call_id" not in started and started["from"] == "14155550100"
+    assert "testing" not in started and started["from"] == "14155550100"
     # last 10 digits match; the numbers come from the per-base-URL cache
     await Call(clock, SimpleNamespace(call_data=CallDataModel(**{"from": "09876543210"}))).start()
     assert len(http.events("started")) == 2
     [get] = http.gets()
     assert get["url"] == "https://api.superbryn.com/public-api/v1/test-calls/caller-numbers"
     assert get["headers"] == {"X-API-Key": "sk_test"}
-    expiry, _ = td._caller_numbers_cache["https://api.superbryn.com"]
+    expiry, _ = cr._caller_numbers_cache[cr._numbers_key("https://api.superbryn.com", "sk_test")]
     assert 3590 < expiry - time.monotonic() <= 3600
 
 
@@ -508,18 +536,45 @@ async def test_no_test_id_and_no_numbers_needs_no_lookup(clock, http):
     assert http.requests == []
 
 
-async def test_caller_numbers_failure_is_remembered_for_a_minute(clock, http):
+BASE = "https://api.superbryn.com"
+
+
+def numbers_left() -> float:
+    """Seconds until this host's caller-number file expires."""
+    with open(cr._numbers_file(BASE, "sk_test"), encoding="utf-8") as f:
+        return json.load(f)["expires_at"] - time.time()
+
+
+def new_process() -> None:
+    """A new process per call: its memory starts empty, the host's file stays."""
+    cr._caller_numbers_cache.clear()
+
+
+async def test_caller_numbers_are_shared_with_a_new_process_on_the_host(clock, http):
+    await Call(clock, from_number="+14155550100").start()
+    new_process()
+    await Call(clock, from_number="+14155550100").start()
+    assert len(http.gets()) == 1 and len(http.events("started")) == 2
+    assert cr._numbers_file(BASE, "sk_test") != cr._numbers_file(BASE, "another agent's key")
+
+
+async def test_an_outage_is_remembered_for_a_minute_and_a_refused_key_for_an_hour(clock, http):
     http.replies = [(500, None)] * 3
     await Call(clock, from_number="+14155550100").start()
     assert len(http.gets()) == 3 and http.events() == []
+    new_process()
     await Call(clock, from_number="+14155550100").start()
     assert len(http.gets()) == 3
-    base = "https://api.superbryn.com"
-    expiry, numbers = td._caller_numbers_cache[base]
-    assert numbers is None and 50 < expiry - time.monotonic() <= 60
-    td._caller_numbers_cache[base] = (time.monotonic() - 1, None)  # the minute is over
+    assert 50 < numbers_left() <= 60
+    os.remove(cr._numbers_file(BASE, "sk_test"))  # the minute is over
+    new_process()
+    http.replies = [(403, {"error": {"code": "insufficient_scope"}})]
     await Call(clock, from_number="+14155550100").start()
-    assert len(http.gets()) == 4 and len(http.events("started")) == 1
+    assert len(http.gets()) == 4 and http.events() == []
+    assert 3590 < numbers_left() <= 3600
+    new_process()
+    await Call(clock, from_number="+14155550100").start()
+    assert len(http.gets()) == 4
 
 
 @pytest.mark.parametrize(
@@ -566,8 +621,9 @@ async def test_event_bodies(clock, http):
     start_fields = {
         "schema_version": 1,
         "call_id": "c-1",
+        "surface": "testing",
         "source": "pipecat",
-        "superbryn_call_id": "sb-1",
+        "testing": {"superbryn_call_id": "sb-1"},
         "agent_id": AGENT_ID,
         "from": "+14155550100",
         "to": "+14155550123",
@@ -585,8 +641,9 @@ async def test_event_bodies(clock, http):
     assert (body["ended_at"], body["ended_reason"]) == ("2027-01-15T08:00:12.500Z", "ended")
     assert body["transcript"] == [] and body["tool_calls"] == []
     assert body["diagnostics"] == {"errors": []}  # nothing else to report, but no failure either
+    assert set(body["context"]) == {"environment"} and "custom_data" not in body
     request = http.requests[-1]
-    assert request["url"] == "https://staging.example.com/public-api/v1/test-calls/agent-data"
+    assert request["url"] == "https://staging.example.com/public-api/v1/calls/agent-data"
     assert request["headers"] == {"X-API-Key": "sk_test", "Content-Type": "application/json"}
 
 
@@ -971,11 +1028,11 @@ async def test_latency_entry_with_all_five_values(clock, http):
     assert ended(http)["diagnostics"]["turn_latencies"] == [
         {
             "turn_id": "a1",
-            "turnLatency": 1100,
-            "endpointingLatency": 240,
-            "transcriberLatency": 300,
-            "modelLatency": 450,
-            "voiceLatency": 120,
+            "turn_ms": 1100,
+            "endpointing_ms": 240,
+            "transcriber_ms": 300,
+            "model_ms": 450,
+            "voice_ms": 120,
         }
     ]
 
@@ -994,7 +1051,7 @@ async def test_late_stt_ttfb_attaches_to_the_last_reply(clock, http):
     await call.push(ttfb(1.5), at=10, source=stt)
     await call.end(at=12)
     latencies = ended(http)["diagnostics"]["turn_latencies"]
-    assert [e.get("transcriberLatency") for e in latencies] == [1900, None]
+    assert [e.get("transcriber_ms") for e in latencies] == [1900, None]
 
 
 async def test_interruption_drops_stale_llm_and_tts_metrics(clock, http):
@@ -1008,8 +1065,8 @@ async def test_interruption_drops_stale_llm_and_tts_metrics(clock, http):
     await agent_turn(call, "Hi.", start=4, stop=5)
     await call.end(at=6)
     [entry] = ended(http)["diagnostics"]["turn_latencies"]
-    assert entry["modelLatency"] == 600 and "voiceLatency" not in entry
-    assert entry["turnLatency"] == 2000
+    assert entry["model_ms"] == 600 and "voice_ms" not in entry
+    assert entry["turn_ms"] == 2000
 
 
 async def test_user_resuming_resets_the_cycle(clock, http):
@@ -1021,7 +1078,7 @@ async def test_user_resuming_resets_the_cycle(clock, http):
     await agent_turn(call, "Sure.", start=5, stop=6)
     await call.end(at=7)
     [entry] = ended(http)["diagnostics"]["turn_latencies"]
-    assert entry == {"turn_id": "a1", "turnLatency": 1000, "endpointingLatency": 800}
+    assert entry == {"turn_id": "a1", "turn_ms": 1000, "endpointing_ms": 800}
 
 
 async def test_no_entry_for_the_greeting_or_a_reply_after_a_tool_call(clock, http):
@@ -1059,7 +1116,7 @@ async def test_endpointing_uses_turn_metrics_else_vad_stop_secs(clock, http):
     await agent_turn(call, "B.", start=7, stop=8)
     await call.end(at=9)
     latencies = ended(http)["diagnostics"]["turn_latencies"]
-    assert [e["endpointingLatency"] for e in latencies] == [200, 255]
+    assert [e["endpointing_ms"] for e in latencies] == [200, 255]
 
 
 async def released_turn(
@@ -1084,7 +1141,7 @@ async def test_endpointing_runs_to_the_turn_release(clock, http):
     await call.end(at=9)
     diagnostics = ended(http)["diagnostics"]
     latencies = diagnostics["turn_latencies"]
-    assert [(e["endpointingLatency"], e["turnLatency"]) for e in latencies] == [
+    assert [(e["endpointing_ms"], e["turn_ms"]) for e in latencies] == [
         (800, 1300),
         (850, 1200),
     ]
@@ -1112,7 +1169,7 @@ async def test_smart_turn_timeout_counts_in_endpointing(clock, http, waits, leas
         )
     await call.end(at=12)
     diagnostics = ended(http)["diagnostics"]
-    assert [e["endpointingLatency"] for e in diagnostics["turn_latencies"]] == [
+    assert [e["endpointing_ms"] for e in diagnostics["turn_latencies"]] == [
         round(w * 1000) for w in waits
     ]
     assert diagnostics["configuration"]["turn_detection"] == {
@@ -1147,7 +1204,7 @@ async def test_speech_to_speech_turn_latency_from_the_callers_audio(clock, http)
     await call.push(BotStoppedSpeakingFrame(), at=4.0, source=out)
     await call.end(at=5)
     assert ended(http)["diagnostics"]["turn_latencies"] == [
-        {"turnLatency": 800, "endpointingLatency": 700, "turn_id": "a1"}
+        {"turn_ms": 800, "endpointing_ms": 700, "turn_id": "a1"}
     ]
 
 
@@ -1160,7 +1217,7 @@ async def test_reply_inside_the_audio_hangover_gets_a_turn_latency(clock, http):
     await call.push(tts_text("Sure."), at=1.8, source=out)
     await call.push(BotStoppedSpeakingFrame(), at=2.5, source=out)
     await call.end(at=3)
-    assert ended(http)["diagnostics"]["turn_latencies"] == [{"turnLatency": 150, "turn_id": "a1"}]
+    assert ended(http)["diagnostics"]["turn_latencies"] == [{"turn_ms": 150, "turn_id": "a1"}]
 
 
 async def test_vad_times_the_turn_when_both_vad_and_audio_are_seen(clock, http):
@@ -1172,7 +1229,7 @@ async def test_vad_times_the_turn_when_both_vad_and_audio_are_seen(clock, http):
     await agent_turn(call, "Sure.", start=3.2, stop=4.0, out=out)
     await call.end(at=5)
     [entry] = ended(http)["diagnostics"]["turn_latencies"]
-    assert entry["turnLatency"] == 700  # from VAD's stop (3.0 - 0.5), not the audio's end
+    assert entry["turn_ms"] == 700  # from VAD's stop (3.0 - 0.5), not the audio's end
 
 
 # ── configuration, tools, pipeline, usage ────────────────────────────────
@@ -1463,7 +1520,7 @@ async def test_stt_audio_time_when_pipecat_reports_it(clock, http, monkeypatch):
         def __init__(self, value):
             self.value, self.model, self.processor = value, None, "stt"
 
-    monkeypatch.setattr(td, "STTUsageMetricsData", STTUsage)
+    monkeypatch.setattr(cr, "STTUsageMetricsData", STTUsage)
     call = await Call(clock, superbryn_call_id="sb").start()
     await call.push(audio(3.0), destination=stt_service())  # measured, but the report wins
     # seconds, as older versions send
@@ -1486,6 +1543,37 @@ async def test_interruption_settings_from_the_user_turn_start_strategies(clock, 
         "min_duration_ms": 300,
         "min_words": 3,
     }
+
+
+@pytest.mark.parametrize(
+    "name, early",
+    [
+        ("ExternalUserTurnCompletionStopStrategy", True),
+        ("LLMTurnCompletionUserTurnStopStrategy", True),
+        ("EagerUserTurnStopStrategy", True),
+        ("SpeechTimeoutUserTurnStopStrategy", False),
+    ],
+)
+async def test_early_drafting_from_the_user_turn_stop_strategies(clock, http, name, early):
+    """Pipecat 1.15 took LLM turn completion off the external-completion class: each counts by its own name."""
+    from pipecat.turns import user_stop
+
+    cls = getattr(user_stop, name, None)
+    if cls is None:
+        pytest.skip(f"{name} is not in this Pipecat version")
+    strategy = cls.__new__(cls)  # only its class is read
+    controller = SimpleNamespace(_user_turn_strategies=SimpleNamespace(stop=[strategy], start=None))
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(
+        LLMContextFrame(context=LLMContext()),
+        at=1,
+        source=SimpleNamespace(_user_turn_controller=controller),
+    )
+    await call.end(at=2)
+    assert (
+        ended(http)["diagnostics"]["configuration"]["turn_detection"]["preemptive_generation"]
+        is early
+    )
 
 
 def _alternative(confidence):
@@ -1550,6 +1638,59 @@ async def test_fatal_error_seen_upstream_means_error(clock, http):
     assert ended(http)["ended_reason"] == "error"
 
 
+TASK_SOURCE = SimpleNamespace(
+    name="task source"
+)  # the worker's pipeline source, where its policy applies
+
+
+@pytest.mark.parametrize("policy", ["end", "cancel"])
+async def test_an_error_from_a_processor_that_can_no_longer_work_means_error_when_the_policy_ends_the_call(
+    clock, http, monkeypatch, policy
+):
+    monkeypatch.setattr(
+        FakeTask, "_processor_unusable_policy", SimpleNamespace(value=policy), raising=False
+    )
+    monkeypatch.setattr(cr, "_task_source", lambda task: TASK_SOURCE)
+    call = await Call(clock, superbryn_call_id="sb").start()
+    broken = SimpleNamespace(
+        is_usable=False
+    )  # Pipecat 1.8+: push_error(..., force_treat_as_permanent=True)
+    error = ErrorFrame("tts key rejected", processor=broken)
+    await call.push(error, direction=UP)  # its first hop: not yet at the task
+    await call.push(
+        error, direction=UP, destination=TASK_SOURCE
+    )  # reaches the task: its policy ends the call
+    await call.end(CancelFrame(), at=1)
+    body = ended(http)
+    assert (body["ended_reason"], body["ended_by"]) == ("error", "system")
+
+
+async def test_a_failover_under_an_ending_policy_is_not_the_calls_end(clock, http, monkeypatch):
+    monkeypatch.setattr(
+        FakeTask, "_processor_unusable_policy", SimpleNamespace(value="end"), raising=False
+    )
+    monkeypatch.setattr(cr, "_task_source", lambda task: TASK_SOURCE)
+    call = await Call(clock, superbryn_call_id="sb").start()
+    primary = SimpleNamespace(
+        is_usable=False
+    )  # a ServiceSwitcher's primary; the switcher keeps its error back
+    await call.push(ErrorFrame("llm key rejected", processor=primary), direction=UP)
+    await call.end(at=1)
+    body = ended(http)
+    assert body["ended_reason"] != "error" and body.get("ended_by") != "system"
+
+
+async def test_an_unusable_processor_under_the_default_policy_is_not_the_calls_end(clock, http):
+    call = await Call(clock, superbryn_call_id="sb").start()
+    broken = SimpleNamespace(
+        is_usable=False
+    )  # e.g. a ServiceSwitcher's primary; the switcher fails over
+    await call.push(ErrorFrame("llm key rejected", processor=broken), direction=UP)
+    await call.end(at=1)
+    body = ended(http)
+    assert body["ended_reason"] != "error" and body.get("ended_by") != "system"
+
+
 # ── limits ───────────────────────────────────────────────────────────────
 
 
@@ -1566,15 +1707,15 @@ async def test_ids_and_names_are_clamped_to_200(clock, http):
     await call.push(tool_start("t2", name="  "), at=2)
     await call.end(at=3)
     for body in http.events():
-        assert len(body["call_id"]) == 200 and len(body["superbryn_call_id"]) == 200
+        assert len(body["call_id"]) == 200 and len(body["testing"]["superbryn_call_id"]) == 200
         assert len(body["event_id"]) <= 200 and body["event_id"].startswith("pc:ccc")
     [tool] = ended(http)["tool_calls"]
     assert len(tool["id"]) == 200 and len(tool["name"]) == 200
 
 
 async def test_turn_latency_and_tool_caps(clock, http, monkeypatch):
-    monkeypatch.setattr(td, "_MAX_TURNS", 3)
-    monkeypatch.setattr(td, "_MAX_TOOL_CALLS", 2)
+    monkeypatch.setattr(cr, "_MAX_TURNS", 3)
+    monkeypatch.setattr(cr, "_MAX_TOOL_CALLS", 2)
     call = await Call(clock, superbryn_call_id="sb").start()
     for i in range(4):
         await user_turn(call, f"u{i}", start=i * 10 + 1, stop=i * 10 + 2)
@@ -1590,7 +1731,7 @@ async def test_a_failing_section_is_left_out(clock, http, monkeypatch, caplog):
     def broken(self, agent_ids):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(td._Capture, "_turn_latencies", broken)
+    monkeypatch.setattr(cr._Capture, "_turn_latencies", broken)
     call = await Call(clock, superbryn_call_id="sb").start()
     await user_turn(call, "hi", start=1, stop=2)
     await agent_turn(call, "Hello.", start=3, stop=4)
@@ -1602,7 +1743,7 @@ async def test_a_failing_section_is_left_out(clock, http, monkeypatch, caplog):
     assert body["diagnostics"]["usage"] == {"tts_characters": 6}
     assert len(body["transcript"]) == 2
     assert messages(caplog, "left out") == [
-        "SUPERBRYN_TEST_DATA_ERROR: turn_latencies left out of call.ended: boom"
+        "SUPERBRYN_CALL_REPORT_ERROR: turn_latencies left out of call.ended: boom"
     ]
 
 
@@ -1624,14 +1765,46 @@ async def test_retryable_statuses(clock, http, status):
 
 
 async def test_client_errors_are_not_retried(clock, http, caplog):
-    http.replies = [(400, {"error": "invalid_body"}), (401, {"error": "unauthorized"})]
+    http.replies = [(200, {"status": "linked", "is_test": True}), (400, {"error": "invalid_body"})]
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         call = await Call(clock, superbryn_call_id="sb").start()
         await call.end(at=1)
     assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]
-    rejected = messages(caplog, "REJECTED")
-    assert len(rejected) == 2 and "test_data:write" not in rejected[0]
-    assert "needs an org API key with test_data:write" in rejected[1]
+    [rejected] = messages(caplog, "REJECTED")
+    assert "400" in rejected and "test_data:write" not in rejected
+
+
+async def test_a_refused_call_started_sends_no_call_ended(clock, http, caplog):
+    http.replies = [(401, {"error": "unauthorized"})]
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        call = await Call(clock, superbryn_call_id="sb").start()
+        await call.end(at=1)
+    assert [e["event"] for e in http.events()] == ["call.started"]  # it would be refused too
+    [rejected] = messages(caplog, "REJECTED")
+    assert (
+        "a SuperBryn test call needs a key with test_data:write; check the key is valid" in rejected
+    )
+
+
+async def test_a_missing_agent_id_names_the_fix(clock, http, caplog):
+    # The server's error shape: {"error": {"code", "message"}}.
+    http.replies = [
+        (400, {"error": {"code": "agent_id_required", "message": "agent_id is required"}})
+    ]
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        await Call(clock, agent_id=None, superbryn_call_id="sb").start()
+    [rejected] = messages(caplog, "REJECTED")
+    assert "set SUPERBRYN_AGENT_ID" in rejected
+
+
+async def test_another_agents_id_names_the_fix(clock, http, caplog):
+    http.replies = [
+        (403, {"error": {"code": "agent_key_mismatch", "message": "not this key's agent"}})
+    ]
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        await Call(clock, agent_id="a", superbryn_call_id="sb").start()
+    [rejected] = messages(caplog, "REJECTED")
+    assert "is not this key's agent" in rejected
 
 
 async def test_gives_up_after_three_attempts_and_still_sends_ended(clock, http):
@@ -1643,27 +1816,27 @@ async def test_gives_up_after_three_attempts_and_still_sends_ended(clock, http):
 
 async def test_timeouts_per_event(clock, http, monkeypatch):
     timeouts: list[tuple[str, float]] = []
-    real_send = td._send
+    real_send = cr._send
 
-    async def spy(method, url, api_key, body, *, timeout):
+    async def spy(method, url, api_key, body, *, timeout, **kwargs):
         timeouts.append((body["event"] if body else method, timeout))
-        return await real_send(method, url, api_key, body, timeout=timeout)
+        return await real_send(method, url, api_key, body, timeout=timeout, **kwargs)
 
-    monkeypatch.setattr(td, "_send", spy)
+    monkeypatch.setattr(cr, "_send", spy)
     call = await Call(clock, from_number="+14155550100").start()
     await call.end(at=1)
     assert timeouts == [("GET", 5.0), ("call.started", 5.0), ("call.ended", 10.0)]
 
 
 async def test_a_slow_attempt_times_out_and_is_retried(clock, http, monkeypatch):
-    monkeypatch.setattr(td, "_STARTED_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(cr, "_STARTED_TIMEOUT_S", 0.01)
     attempts = []
 
     async def slow(method, url, headers, data):
         attempts.append(method)
         await asyncio.sleep(1)
 
-    monkeypatch.setattr(td, "_http_request", slow)
+    monkeypatch.setattr(cr, "_http_request", slow)
     await Call(clock, superbryn_call_id="sb").start()
     assert attempts == ["POST"] * 3
 
@@ -1675,7 +1848,7 @@ async def test_a_call_ending_during_the_number_lookup_sends_nothing_at_once(
         http.requests.append({"method": method})
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr(td, "_http_request", hang)
+    monkeypatch.setattr(cr, "_http_request", hang)
     call = Call(clock, from_number="+14155550100")
     await call.observer.on_pipeline_started()
     await asyncio.sleep(0)  # the caller-number lookup is under way
@@ -1695,7 +1868,7 @@ async def test_a_number_matched_call_still_sending_call_started_keeps_its_record
             await asyncio.sleep(0.3)
         return await http(method, url, headers, data)
 
-    monkeypatch.setattr(td, "_http_request", slow_started)
+    monkeypatch.setattr(cr, "_http_request", slow_started)
     call = Call(clock, from_number="+14155550100")
     await call.observer.on_pipeline_started()
     await asyncio.sleep(0.05)  # recognised by its number; call.started is on its way
@@ -1707,7 +1880,7 @@ async def test_a_number_matched_call_still_sending_call_started_keeps_its_record
 async def test_the_finish_handler_gives_up_after_one_budget(
     clock, http, monkeypatch, caplog, hangs
 ):
-    monkeypatch.setattr(td, "_FINISH_BUDGET_S", 0.2)
+    monkeypatch.setattr(cr, "_FINISH_BUDGET_S", 0.2)
 
     async def answer(method, url, headers, data):
         http.requests.append({"method": method, "body": json.loads(data)})
@@ -1715,15 +1888,15 @@ async def test_the_finish_handler_gives_up_after_one_budget(
             await asyncio.sleep(3600)
         return 200, {"status": "linked", "is_test": True}
 
-    monkeypatch.setattr(td, "_http_request", answer)
-    call = Call(clock, superbryn_call_id="sb")
+    monkeypatch.setattr(cr, "_http_request", answer)
+    call = Call(clock, superbryn_call_id="sb", call_id="c-1")
     await call.observer.on_pipeline_started()
     began = time.monotonic()
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         await call.end(at=2)
     assert 0.2 <= time.monotonic() - began < 1
     assert messages(caplog, "not sent within") == [
-        "SUPERBRYN_TEST_DATA_FAILED: call.ended not sent within 0.2s of the call's end"
+        "SUPERBRYN_CALL_REPORT_FAILED: call.ended for call c-1 not sent within 0.2s of the call's end"
     ]
     assert call.observer._start_task.done()
     assert [e["event"] for e in http.events()][-1] == hangs
@@ -1784,20 +1957,21 @@ async def test_no_key_warns_once_and_does_nothing(clock, http, caplog):
 
 async def test_env_configuration(clock, http, monkeypatch):
     monkeypatch.setenv("SUPERBRYN_API_KEY", "sk_general")
-    monkeypatch.setenv("SUPERBRYN_TEST_API_KEY", "sk_test_data")
+    monkeypatch.setenv("SUPERBRYN_TEST_API_KEY", "sk_test_data")  # 0.11's eval key: not read
     monkeypatch.setenv("SUPERBRYN_BASE_URL", "http://localhost:3000/")
     monkeypatch.setenv("SUPERBRYN_AGENT_ID", AGENT_ID)
     await Call(clock, api_key=None, agent_id=None, superbryn_call_id="sb").start()
     request = http.requests[0]
-    assert request["headers"]["X-API-Key"] == "sk_test_data"
-    assert request["url"] == "http://localhost:3000/public-api/v1/test-calls/agent-data"
+    assert request["headers"]["X-API-Key"] == "sk_general"
+    assert request["url"] == "http://localhost:3000/public-api/v1/calls/agent-data"
     assert request["body"]["agent_id"] == AGENT_ID
 
 
-async def test_api_key_falls_back_to_superbryn_api_key(clock, http, monkeypatch):
-    monkeypatch.setenv("SUPERBRYN_API_KEY", "sk_general")
-    await Call(clock, api_key=None, superbryn_call_id="sb").start()
-    assert http.requests[0]["headers"]["X-API-Key"] == "sk_general"
+@pytest.mark.parametrize("value", ["false", "0", " OFF "])
+async def test_superbryn_observer_enabled_off_sends_nothing(clock, http, monkeypatch, value):
+    monkeypatch.setenv("SUPERBRYN_OBSERVER_ENABLED", value)
+    call = Call(clock, superbryn_call_id="sb", production=True)
+    assert call.observer is None and call.task.handlers == {} and http.requests == []
 
 
 @pytest.mark.parametrize(
@@ -1810,33 +1984,28 @@ async def test_api_key_falls_back_to_superbryn_api_key(clock, http, monkeypatch)
     ],
     ids=["missing", "name", "version-0", "wrong-variant"],
 )
-async def test_no_valid_agent_id_sends_nothing(clock, http, caplog, agent_id):
+async def test_an_agent_id_that_is_not_a_uuid_is_left_out(clock, http, caplog, agent_id):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         for _ in range(2):
-            assert Call(clock, agent_id=agent_id, superbryn_call_id="sb").observer is None
-    assert http.requests == []
-    assert len(messages(caplog, "SUPERBRYN_TEST_DATA_DISABLED")) == 1
-    reason = (
-        f"{agent_id!r} is not a SuperBryn agent ID"
-        if agent_id
-        else "no agent ID, set SUPERBRYN_AGENT_ID"
-    )
-    assert len(messages(caplog, reason)) == 1
+            call = await Call(clock, agent_id=agent_id, superbryn_call_id="sb").start()
+            await call.end(at=1)
+    assert [e["event"] for e in http.events()] == ["call.started", "call.ended"] * 2
+    assert all("agent_id" not in e for e in http.events())
+    warned = messages(caplog, "is not a SuperBryn agent ID")
+    assert len(warned) == (1 if agent_id else 0)
 
 
 async def test_metrics_off_warns_once(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         for metrics_on in (False, False, True):
-            attach_test_data(FakeTask(metrics=metrics_on), api_key="k", agent_id=AGENT_ID)
+            attach(FakeTask(metrics=metrics_on), api_key="k", agent_id=AGENT_ID)
     [message] = messages(caplog, "PipelineParams")
     assert "enable_metrics and enable_usage_metrics" in message
 
 
 async def test_attach_never_raises(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        attach_test_data(
-            object(), SimpleNamespace(body=12, call_data="x"), api_key="k", agent_id=AGENT_ID
-        )
+        attach(object(), SimpleNamespace(body=12, call_data="x"), api_key="k", agent_id=AGENT_ID)
     assert len(messages(caplog, "could not attach")) == 1
 
 
@@ -1898,7 +2067,7 @@ async def test_hooks_fire_in_a_real_pipeline_task(http, monkeypatch):
     from pipecat.workers.runner import WorkerRunner
 
     monkeypatch.setattr(
-        td, "_DRAIN_TIMEOUT_S", 60
+        cr, "_DRAIN_TIMEOUT_S", 60
     )  # only the EndFrame reaching the sink ends the wait
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -1908,7 +2077,7 @@ async def test_hooks_fire_in_a_real_pipeline_task(http, monkeypatch):
             cancel_on_idle_timeout=False,
             enable_rtvi=False,
         )
-    attach_test_data(
+    attach(
         task, SimpleNamespace(body={"superbryn_call_id": "sb-real"}), api_key="k", agent_id=AGENT_ID
     )
 
@@ -1933,13 +2102,13 @@ async def test_hooks_fire_in_a_real_pipeline_task(http, monkeypatch):
 
     assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]
     body = ended(http)
-    assert (body["superbryn_call_id"], body["ended_reason"]) == ("sb-real", "ended")
+    assert (body["testing"]["superbryn_call_id"], body["ended_reason"]) == ("sb-real", "ended")
     assert texts(body) == [("u1", "user", "hello bot"), ("a1", "agent", "Hello human.")]
     [entry] = body["diagnostics"]["turn_latencies"]
-    assert entry["turn_id"] == "a1" and entry["turnLatency"] >= 0
+    assert entry["turn_id"] == "a1" and entry["turn_ms"] >= 0
 
 
-def real_task(*processors: FrameProcessor, attach: bool = True) -> Any:
+def real_task(*processors: FrameProcessor, attached: bool = True) -> Any:
     """A real PipelineTask over the processors and a pass-through output, test data attached."""
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.task import PipelineTask
@@ -1952,9 +2121,9 @@ def real_task(*processors: FrameProcessor, attach: bool = True) -> Any:
             cancel_on_idle_timeout=False,
             enable_rtvi=False,
         )
-    if attach:
+    if attached:
         args = SimpleNamespace(body={"superbryn_call_id": "sb-real"})
-        attach_test_data(task, args, api_key="k", agent_id=AGENT_ID)
+        attach(task, args, api_key="k", agent_id=AGENT_ID)
     return task
 
 
@@ -2003,7 +2172,7 @@ FakeRealtimeLLM.__module__ = "pipecat.services.openai.realtime.llm"
 
 
 async def test_realtime_caller_line_in_a_real_pipeline(http, monkeypatch):
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
     llm = FakeRealtimeLLM(settings=LLMSettings(model="gpt-realtime"))
     task = real_task(TakesCallerTranscript(), Forward(), llm)
 
@@ -2052,7 +2221,7 @@ async def test_endpointing_with_a_real_speech_timeout_strategy(http, monkeypatch
     )
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
     stop = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.3)
     params = LLMUserAggregatorParams(user_turn_strategies=UserTurnStrategies(stop=[stop]))
     task = real_task(LLMUserAggregator(LLMContext(), params=params))
@@ -2076,12 +2245,12 @@ async def test_endpointing_with_a_real_speech_timeout_strategy(http, monkeypatch
     diagnostics = ended(http)["diagnostics"]
     [entry] = diagnostics["turn_latencies"]
     # 0.2 s of VAD silence plus the strategy's 0.3 s wait; the VAD-only estimate said 200
-    assert 500 <= entry["endpointingLatency"] <= entry["turnLatency"]
+    assert 500 <= entry["endpointing_ms"] <= entry["turn_ms"]
     detection = diagnostics["configuration"]["turn_detection"]
     # the speech-timeout strategy starts the LLM only as the turn ends: no early drafts
     assert detection == {
         "type": "vad",
-        "min_end_of_turn_ms": entry["endpointingLatency"],
+        "min_end_of_turn_ms": entry["endpointing_ms"],
         "preemptive_generation": False,
     }
 
@@ -2100,7 +2269,7 @@ async def test_llm_judged_turn_completion_drafts_replies_early_in_a_real_pipelin
     )
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
     # the detector starts the LLM; the LLM's own marker says whether the turn was complete (else it is dropped)
     stop = [
         deferred(SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.3)),
@@ -2144,7 +2313,7 @@ async def test_output_stamped_speech_to_speech_sends_no_requests_or_caller_times
 ):
     # the real class; Pipecat raises ImportError without its aws / google extra
     cls = getattr(pytest.importorskip(module, exc_type=ImportError), name)
-    assert (cls.__module__, cls.__qualname__) in td._OUTPUT_STAMPED_LLMS
+    assert (cls.__module__, cls.__qualname__) in cr._OUTPUT_STAMPED_LLMS
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         llm = cls(**kwargs)
@@ -2200,7 +2369,7 @@ async def test_muted_speech_in_a_real_pipeline(http, monkeypatch):
     )
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
     params = LLMUserAggregatorParams(
         user_turn_strategies=UserTurnStrategies(
             stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.05)]
@@ -2236,24 +2405,24 @@ async def test_muted_speech_in_a_real_pipeline(http, monkeypatch):
 
 @pytest.mark.parametrize("late", [False, True], ids=["before-run", "after-start"])
 async def test_attach_time_in_a_real_pipeline(http, monkeypatch, caplog, late):
-    monkeypatch.setattr(td, "_DRAIN_TIMEOUT_S", 60)
-    task = real_task(attach=False)
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
+    task = real_task(attached=False)
 
-    def attach():
+    def attach_report():
         args = SimpleNamespace(body={"superbryn_call_id": "sb-real"})
-        attach_test_data(task, args, api_key="k", agent_id=AGENT_ID)
+        attach(task, args, api_key="k", agent_id=AGENT_ID)
 
     async def script():
         await asyncio.sleep(0.2)
         if late:
-            attach()  # e.g. in on_client_connected, once the pipeline is running
+            attach_report()  # e.g. in on_client_connected, once the pipeline is running
         for frame in (BotStartedSpeakingFrame(), tts_text("Hello."), BotStoppedSpeakingFrame()):
             await task.queue_frame(frame)
             await asyncio.sleep(0.05)
         await task.queue_frame(EndFrame())
 
     if not late:
-        attach()
+        attach_report()
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         await run(task, script)
     assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]
@@ -2261,3 +2430,765 @@ async def test_attach_time_in_a_real_pipeline(http, monkeypatch, caplog, late):
     [turn] = body["transcript"]
     assert body["started_at"] < body["ended_at"] and 0 < turn["end_ms"] < 1000
     assert len(messages(caplog, "after the task started")) == int(late)
+
+
+# ── production calls (surface "observability") ────────────────────────────
+
+
+class FakeRecorder:
+    """SuperbrynAudioRecorder stand-in: what was asked of it, and a WAV file to hand over."""
+
+    num_channels = 2
+
+    def __init__(self, path) -> None:
+        self.path, self.events = path, []
+
+    async def start(self) -> None:
+        self.events.append("start")
+
+    async def stop(self) -> None:
+        self.events.append("stop")
+
+    async def finalize(self):
+        self.events.append("finalize")
+        return self.path
+
+    def cleanup(self) -> None:
+        self.events.append("cleanup")
+
+
+@pytest.fixture
+def recording(monkeypatch, tmp_path) -> SimpleNamespace:
+    """The recorder attach() inserts, and the presign + upload, stubbed: no pipeline, no S3."""
+    rec = SimpleNamespace(recorders=[], presigned=[], uploaded=[], upload_ok=True)
+
+    def insert(pipeline):
+        path = tmp_path / f"call-{len(rec.recorders)}.wav"
+        path.write_bytes(b"RIFF")
+        rec.recorders.append(FakeRecorder(path))
+        return rec.recorders[-1]
+
+    async def presign(base_url, api_key, session_id, num_channels):
+        rec.presigned.append((base_url, api_key, session_id, num_channels))
+        return {
+            "upload_url": f"https://s3.test/put/{session_id}",
+            "public_url": f"https://s3.test/observability/pipecat/{session_id}-2ch.wav",
+        }
+
+    async def upload(url, path):
+        rec.uploaded.append((url, path))
+        return rec.upload_ok
+
+    monkeypatch.setattr(cr, "_insert_recorder", insert)
+    monkeypatch.setattr(cr, "fetch_recording_upload_url", presign)
+    monkeypatch.setattr(cr, "upload_wav_via_presigned", upload)
+    return rec
+
+
+def runner(**fields: Any) -> SimpleNamespace:
+    return SimpleNamespace(session_id="sess-1", **fields)
+
+
+async def test_a_production_call_is_reported_with_its_recording(clock, http, recording):
+    call = await Call(clock, runner(), production=True).start()
+    started = http.events("started")[0]
+    assert started == {
+        "schema_version": 1,
+        "event_id": "pc:sess-1:started",
+        "event": "call.started",
+        "surface": "observability",
+        "source": "pipecat",
+        "call_id": "sess-1",
+        "agent_id": AGENT_ID,
+        "started_at": "2027-01-15T08:00:00.000Z",
+        "observability": {"mode": "observe"},
+    }
+    await user_turn(call, "hi", start=1, stop=2)
+    await agent_turn(call, "Hello.", start=3, stop=4)
+    await call.end(at=5)
+    body = ended(http)
+    assert body["event_id"] == "pc:sess-1:ended" and "testing" not in body
+    url = "https://s3.test/observability/pipecat/sess-1-2ch.wav"
+    assert body["observability"] == {
+        "mode": "observe",
+        "recording_url": url,
+        "stereo_recording_url": url,
+        "recording_url_source": "superbryn_s3",
+    }
+    [recorder] = recording.recorders
+    assert recorder.events == ["start", "finalize", "stop", "cleanup"]
+    assert recording.presigned == [("https://api.superbryn.com", "sk_test", "sess-1", 2)]
+    assert texts(body) == [("u1", "user", "hi"), ("a1", "agent", "Hello.")]
+
+
+async def test_call_ids_per_surface(clock, http, recording):
+    """A test call keeps the telephony call's ID (Custom cURL matches it); a production call the runner's
+    session ID, as 0.11 named Monitor calls; call_id= names both."""
+    twilio = CallDataModel(call_id="CA1", **{"from": "+15550001111", "to": "+15550002222"})
+    await Call(clock, runner(call_data=twilio), production=True).start()
+    await Call(clock, runner(call_data=twilio), production=True, superbryn_call_id="sb").start()
+    await Call(clock, runner(call_data=twilio), production=True, call_id="mine").start()
+    assert [(e["surface"], e["call_id"]) for e in http.events("started")] == [
+        ("observability", "sess-1"),
+        ("testing", "CA1"),
+        ("observability", "mine"),
+    ]
+    # without a session ID, a production call gets a random one
+    await Call(clock, production=True).start()
+    assert len(http.events("started")[-1]["call_id"]) == 36
+
+
+async def test_production_false_sends_nothing_and_records_nothing(clock, http, recording):
+    call = await Call(clock, runner(), production=False).start()
+    await user_turn(call, "hi", start=1, stop=2)
+    await call.end(at=3)
+    assert http.requests == [] and recording.recorders == []
+    assert call.observer._logs is None
+
+
+async def test_record_false_sends_no_recording(clock, http, recording):
+    call = await Call(clock, runner(), production=True, record=False).start()
+    await call.end(at=2)
+    assert ended(http)["observability"] == {"mode": "observe"}
+    assert recording.recorders == [] and recording.uploaded == []
+
+
+async def test_an_upload_that_fails_leaves_the_call_unrecorded_not_unreported(
+    clock, http, recording
+):
+    recording.upload_ok = False
+    call = await Call(clock, runner(), production=True).start()
+    await call.end(at=2)
+    assert ended(http)["observability"] == {"mode": "observe"}
+    assert recording.recorders[0].events[-1] == "cleanup"
+
+
+@pytest.mark.parametrize("when", ["before-start", "during-call"])
+async def test_your_own_recording_is_sent_instead(clock, http, recording, when):
+    call = Call(clock, runner(), production=True)
+    if when == "before-start":
+        call.report.set_recording_url(" https://my.bucket/call-1.mp3 ")
+    await call.start()
+    if when == "during-call":
+        call.report.set_recording_url("https://my.bucket/call-1.mp3")
+    await call.end(at=2)
+    assert ended(http)["observability"] == {
+        "mode": "observe",
+        "recording_url": "https://my.bucket/call-1.mp3",
+        "recording_url_source": "external",
+    }
+    [recorder] = recording.recorders
+    assert "start" in recorder.events if when == "during-call" else "start" not in recorder.events
+    assert recording.uploaded == [] and recorder.events[-1] == "cleanup"
+
+
+async def test_a_test_call_found_by_its_number_is_not_recorded(clock, http, recording):
+    call = await Call(clock, runner(), production=True, from_number="+14155550100").start()
+    assert http.events("started")[0]["surface"] == "testing"
+    assert recording.recorders[0].events == ["start", "stop", "cleanup"]  # dropped once recognised
+    logging.getLogger("agent").info("during the test call")
+    await call.end(at=2)
+    body = ended(http)
+    assert "observability" not in body and "logs" not in body["diagnostics"]
+    assert recording.uploaded == []
+
+
+async def test_a_call_known_to_be_a_test_is_never_recorded(clock, http, recording):
+    await Call(clock, runner(), production=True, superbryn_call_id="sb").start()
+    assert recording.recorders == []
+
+
+async def test_a_production_call_ending_during_the_number_lookup_waits_for_it(
+    clock, http, monkeypatch, recording
+):
+    async def slow_numbers(method, url, headers, data):
+        if method == "GET":
+            await asyncio.sleep(0.2)
+        return await http(method, url, headers, data)
+
+    monkeypatch.setattr(cr, "_http_request", slow_numbers)
+    http.numbers = []
+    call = Call(clock, runner(), production=True, from_number="+15550001111")
+    await call.observer.on_pipeline_started()
+    await call.end(at=1)
+    assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]
+
+
+async def test_simulation_is_a_track_run_without_recording_or_prompt(
+    clock, http, recording, pushes
+):
+    context = LLMContext(messages=[{"role": "system", "content": "Draft prompt."}])
+    call = await Call(
+        clock, runner(), production=True, simulation=True, prompt="Draft {x}", prompt_version="v2"
+    ).start()
+    await call.push(LLMContextFrame(context=context), at=1)
+    await call.end(at=2)
+    body = ended(http)
+    assert http.events("started")[0]["observability"] == {"mode": "track"}
+    assert body["observability"] == {"mode": "track"}
+    assert recording.recorders == [] and pushes == []
+    assert not {"system_prompt", "prompt_ref"} & body["context"].keys()
+
+
+async def test_prompt_sync_names_the_prompt_and_pushes_it_once_confirmed(clock, http, pushes):
+    context = LLMContext(messages=[{"role": "system", "content": "You are Acme's agent."}])
+    call = await Call(
+        clock, runner(), production=True, record=False, prompt="You are {who}.", prompt_version=13
+    ).start()
+    await call.push(LLMContextFrame(context=context), at=1)
+    await call.end(at=2)
+    [push] = pushes
+    assert (push["template"], push["version"], push["api_key"]) == (
+        "You are {who}.",
+        "13",
+        "sk_test",
+    )
+    assert push["api_base_url"] == "https://api.superbryn.com"
+    context_block = ended(http)["context"]
+    assert context_block["prompt_ref"] == {
+        "hash": "sha256:" + __import__("hashlib").sha256(b"You are {who}.").hexdigest(),
+        "version": "13",
+    }
+    assert context_block["system_prompt"] == "You are Acme's agent."
+
+
+async def test_no_prompt_push_for_a_refused_call(clock, http, pushes):
+    http.replies = [(403, {"error": "forbidden"})]
+    await Call(clock, runner(), production=True, record=False, prompt="P").start()
+    assert pushes == []
+
+
+async def test_custom_data_is_sent_as_given(clock, http, caplog):
+    call = Call(
+        clock,
+        runner(),
+        production=True,
+        record=False,
+        custom_data={"workflow_id": 4471, "tenant": "acme", "tags": ["a", "b"]},
+    )
+    await call.start()
+    call.report.update_custom_data({"booked": True, "at": datetime(2027, 1, 15, tzinfo=UTC)})
+    call.report.set_call_end_reason(" transfer_to_human ")
+    await call.end(at=2)
+    body = ended(http)
+    assert body["custom_data"] == {
+        "workflow_id": 4471,
+        "tenant": "acme",
+        "tags": ["a", "b"],
+        "booked": True,
+        "at": "2027-01-15 00:00:00+00:00",
+    }
+    assert body["ended_reason"] == "transfer_to_human"
+    assert "custom_data" not in http.events("started")[0]
+
+
+async def test_custom_data_that_cannot_be_json_is_left_out(clock, http, caplog):
+    call = await Call(clock, superbryn_call_id="sb", custom_data={"score": math.nan}).start()
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        await call.end(at=1)
+    assert "custom_data" not in ended(http)
+    assert len(messages(caplog, "custom_data left out")) == 1
+
+
+async def test_custom_data_that_is_not_a_dict_is_left_out(clock, http, caplog):
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        call = await Call(clock, superbryn_call_id="sb", custom_data=[1, 2]).start()
+    await call.end(at=1)
+    assert "custom_data" not in ended(http)
+    assert len(messages(caplog, "set_custom_data takes a dict, got list")) == 1
+
+
+@pytest.fixture
+def app_logs_info():
+    """The app's own logging config lets its INFO lines through, as an app that logs them has."""
+    agent = logging.getLogger("agent")
+    before = agent.level
+    agent.setLevel(logging.INFO)
+    yield
+    agent.setLevel(before)
+
+
+async def test_session_logs_go_with_a_production_call(clock, http, app_logs_info):
+    call = await Call(clock, runner(), production=True, record=False).start()
+    logging.getLogger("agent.tools").info("lookup_order called via logging")
+    loguru_logger.info("lookup_order called via loguru")
+    logging.getLogger("superbryn_pipecat_observer.call_report").info("our own line")
+    logging.getLogger("agent").debug("below INFO")
+    await call.end(at=2)
+    logging.getLogger("agent").info("after the call")
+    logs = ended(http)["diagnostics"]["logs"]
+    assert [(r["level"], r["message"]) for r in logs] == [
+        ("INFO", "lookup_order called via logging"),
+        ("INFO", "lookup_order called via loguru"),
+    ]
+    assert logs[0]["name"] == "agent.tools" and logs[0]["ts"].endswith("+00:00")
+    assert call.observer._logs._handler is None  # detached
+
+
+async def test_capture_logs_false_sends_none(clock, http):
+    call = await Call(clock, runner(), production=True, record=False, capture_logs=False).start()
+    logging.getLogger("agent").info("not sent")
+    await call.end(at=2)
+    assert "logs" not in ended(http)["diagnostics"]
+
+
+async def test_session_logs_are_this_calls_only_and_leave_the_log_levels_alone(
+    clock, http, app_logs_info
+):
+    root_level = logging.getLogger().level
+    call = await Call(clock, runner(), production=True, record=False).start()
+    assert logging.getLogger().level == root_level
+
+    async def another_call():
+        logging.getLogger("agent").info("another caller's line")
+        loguru_logger.info("another caller's loguru line")
+
+    await asyncio.create_task(another_call(), context=contextvars.Context())
+    logging.getLogger("agent").info("this caller's line " + "x" * 3000)
+    await call.end(at=2)
+    [line] = ended(http)["diagnostics"]["logs"]
+    assert line["message"].startswith("this caller's line") and len(line["message"]) == 2000
+
+
+async def test_session_logs_are_capped(clock, http, monkeypatch, app_logs_info):
+    monkeypatch.setattr(cr, "_MAX_LOGS", 3)
+    call = await Call(clock, runner(), production=True, record=False).start()
+    for i in range(5):
+        logging.getLogger("agent").info("line %d", i)
+    await call.end(at=2)
+    assert [r["message"] for r in ended(http)["diagnostics"]["logs"]] == [
+        "line 0",
+        "line 1",
+        "line 2",
+    ]
+
+
+class RTVIProcessor(FrameProcessor):
+    """Named as Pipecat's: it passes on a web client's disconnect-bot as an EndWorkerFrame."""
+
+
+@pytest.mark.parametrize(
+    ("signal", "want"),
+    [
+        ("tool", "agent"),
+        ("rtvi", "caller"),
+        ("app", None),
+        ("hang-up", "caller"),
+        ("fatal", "system"),
+        ("none", None),
+    ],
+)
+async def test_ended_by(clock, http, signal, want):
+    call = await Call(clock, superbryn_call_id="sb").start()
+    if signal == "tool":
+        await call.push(EndWorkerFrame(), at=1, source=llm_service())
+    elif signal == "rtvi":
+        await call.push(EndWorkerFrame(), at=1, source=RTVIProcessor())
+    elif signal == "app":  # the app queued it itself: no processor pushed it
+        await call.push(EndWorkerFrame(), at=1, source=None)
+    elif signal == "hang-up":
+        call.observer._capture.caller_left(object(), object())
+    elif signal == "fatal":
+        await call.push(ErrorFrame("boom", fatal=True), at=1, source=llm_service())
+    await call.end(at=2)
+    assert ended(http).get("ended_by") == want
+
+
+async def test_a_hang_up_after_the_end_frame_is_not_the_callers(clock, http):
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(EndFrame(), at=1)
+    call.observer._capture.caller_left()  # the transport closing after the agent ended the call
+    await call.end(at=2)
+    assert "ended_by" not in ended(http)
+
+
+async def test_caller_keypresses(clock, http):
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(InputDTMFFrame(button=KeypadEntry.ONE), at=1.5)
+    await call.push(InputDTMFFrame(button=KeypadEntry.POUND), at=2)
+    await call.end(at=3)
+    assert ended(http)["diagnostics"]["dtmf"] == [
+        {"at_ms": 1500, "digit": "1"},
+        {"at_ms": 2000, "digit": "#"},
+    ]
+
+
+async def test_prompted_tool_calls_are_lifted_out_of_the_text(clock, http):
+    llm, out = llm_service(), FakeOutput(TransportParams())
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await user_turn(call, "my cart please", start=1, stop=2)
+    await call.push(LLMFullResponseStartFrame(), at=3, source=llm)
+    reply = 'Let me look. <tool_use>{"tool": "get_cart", "items": [1]}</tool_use> <tool_use>{bad</tool_use>'
+    for part in (reply[:20], reply[20:]):  # streamed in pieces
+        await call.push(LLMTextFrame(part), at=3.1, source=llm)
+    await call.push(BotStartedSpeakingFrame(), at=3.2, source=out)
+    await call.push(BotStoppedSpeakingFrame(), at=4, source=out)
+    await call.end(at=5)
+    body = ended(http)
+    assert body["transcript"][1]["text"] == "Let me look. <tool_use>{bad</tool_use>"
+    assert body["tool_calls"] == [
+        {
+            "name": "get_cart",
+            "arguments": {"tool": "get_cart", "items": [1]},
+            "start_ms": 3000,
+            "turn_id": "a1",
+        }
+    ]
+
+
+async def test_daily_dial_in_names_the_direction_and_room(clock, http):
+    settings = {
+        "call_id": "daily-call",
+        "call_domain": "d",
+        "From": "+15550001111",
+        "To": "+15550002222",
+    }
+    body = {"dialin_settings": settings}
+    args = runner(body=body, room_url="https://acme.daily.co/room-1")
+    call = await Call(clock, args, production=True, record=False).start()
+    await call.end(at=1)
+    started, done = http.events("started")[0], ended(http)
+    assert started["observability"] == {"direction": "inbound", "mode": "observe"}
+    assert (started["call_id"], started["from"], started["to"]) == (
+        "sess-1",
+        "+15550001111",
+        "+15550002222",
+    )
+    assert done["context"]["room_url"] == "https://acme.daily.co/room-1"
+    dialout = runner(body={"dialout_settings": [{"phoneNumber": "+15550003333"}]})
+    await Call(clock, dialout, production=True, record=False).start()
+    assert http.events("started")[-1]["observability"]["direction"] == "outbound"
+
+
+async def test_environment_names_the_versions(clock, http):
+    import platform
+
+    from superbryn_pipecat_observer import __version__
+
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.end(at=1)
+    environment = ended(http)["context"]["environment"]
+    assert environment["pipecat_observer_version"] == __version__
+    assert environment["pipeline_version"] == f"@superbryn/pipecat-observer@{__version__}"
+    assert environment["python_version"] == platform.python_version()
+    assert environment["pipecat_version"].count(".") >= 2
+
+
+def test_metrics_left_unset_are_switched_on():
+    params = PipelineParams(enable_metrics=True)  # usage left unset: tokens would read 0
+    task = FakeTask()
+    task.params = params
+    attach(task, api_key="k")
+    assert params.enable_usage_metrics is True and params.enable_metrics is True
+
+
+async def test_attach_twice_on_one_task_uses_the_first(clock, http, caplog):
+    call = Call(clock, superbryn_call_id="sb")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        attach(call.task, api_key="k", superbryn_call_id="other")
+    assert len(call.task.observers) == 1
+    assert len(messages(caplog, "attach already ran")) == 1
+
+
+# ── the recorder in a real pipeline ──────────────────────────────────────
+
+
+class PhoneTransport(BaseTransport):
+    """A transport with the hang-up event network transports have; input and output keep it as theirs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._register_event_handler("on_client_disconnected")
+        self.inp = BaseInputTransport(TransportParams())
+        self.out = PassThroughOutput(TransportParams(), enable_direct_mode=True)
+        self.inp._transport = self.out._transport = self
+
+    def input(self):
+        return self.inp
+
+    def output(self):
+        return self.out
+
+
+def pcm(seconds: float, rate: int = 16000) -> bytes:
+    samples = (np.sin(np.arange(int(seconds * rate)) * 0.2) * 8000).astype(np.int16)
+    return samples.tobytes()
+
+
+async def test_the_recorder_records_both_sides_in_a_real_pipeline(http, monkeypatch, tmp_path):
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.task import PipelineTask
+    from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
+    uploads: dict[str, bytes] = {}
+
+    async def presign(base_url, api_key, session_id, num_channels):
+        return {
+            "upload_url": "https://s3.test/put",
+            "public_url": f"https://s3.test/{session_id}.wav",
+        }
+
+    async def upload(url, path):
+        uploads[url] = path.read_bytes()
+        return True
+
+    monkeypatch.setattr(cr, "fetch_recording_upload_url", presign)
+    monkeypatch.setattr(cr, "upload_wav_via_presigned", upload)
+    transport = PhoneTransport()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        task = PipelineTask(
+            Pipeline([Forward(), transport.output()]),
+            params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000),
+            cancel_on_idle_timeout=False,
+            enable_rtvi=False,
+        )
+    report = attach(task, SimpleNamespace(session_id="sess-real"), api_key="k")
+    inner = task.pipeline.processors[1]
+    names = [type(p).__name__ for p in inner.processors]
+    assert names[-3:] == ["AudioBufferProcessor", "PassThroughOutput", "PipelineSink"]
+    assert isinstance(inner.processors[-3], AudioBufferProcessor)
+    handlers = transport._event_handlers["on_client_disconnected"].handlers
+    assert len(handlers) == 1  # the hang-up hook
+    assert report is not None
+
+    async def script():
+        await asyncio.sleep(0.1)
+        await task.queue_frame(
+            InputAudioRawFrame(audio=pcm(0.5), sample_rate=16000, num_channels=1)
+        )
+        await asyncio.sleep(0.05)
+        await task.queue_frame(
+            OutputAudioRawFrame(audio=pcm(0.4), sample_rate=16000, num_channels=1)
+        )
+        await asyncio.sleep(0.05)
+        await transport._call_event_handler("on_client_disconnected", None)
+        await asyncio.sleep(0.05)
+        await task.queue_frame(EndFrame())
+
+    await run(task, script)
+    body = ended(http)
+    assert (body["surface"], body["call_id"], body["ended_by"]) == (
+        "observability",
+        "sess-real",
+        "caller",
+    )
+    assert body["observability"]["stereo_recording_url"] == "https://s3.test/sess-real.wav"
+    assert body["context"]["environment"]["transport"] == "phone"
+    [wav_bytes] = uploads.values()
+    with wave.open(__import__("io").BytesIO(wav_bytes)) as w:
+        frames = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).reshape(-1, 2)
+        assert (w.getnchannels(), w.getframerate()) == (2, 16000)
+    left, right = (np.abs(frames[:, i]).max() for i in (0, 1))
+    assert left > 1000 and right > 1000  # the caller left, the agent right
+    assert not list(tmp_path.iterdir())  # nothing kept here; the recorder's temp file is gone too
+
+
+class RoomTransport(PhoneTransport):
+    """A transport like LiveKit's: no on_client_disconnected, only on_participant_left."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        del self._event_handlers["on_client_disconnected"]
+        self._register_event_handler("on_participant_left")
+
+
+async def test_a_participant_leaving_a_room_is_the_caller_hanging_up(http):
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.task import PipelineTask
+
+    transport = RoomTransport()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        task = PipelineTask(
+            Pipeline([Forward(), transport.output()]),
+            cancel_on_idle_timeout=False,
+            enable_rtvi=False,
+        )
+    attach(task, SimpleNamespace(session_id="sess-room"), api_key="k", record=False)
+    assert len(transport._event_handlers["on_participant_left"].handlers) == 1
+
+    async def script():
+        await asyncio.sleep(0.05)
+        await transport._call_event_handler("on_participant_left", "PA_caller", "disconnected")
+        await asyncio.sleep(0.05)
+        await task.queue_frame(EndFrame())
+
+    await run(task, script)
+    assert ended(http)["ended_by"] == "caller"
+
+
+async def test_no_recorder_once_the_pipeline_runs(http, monkeypatch, caplog):
+    monkeypatch.setattr(cr, "_DRAIN_TIMEOUT_S", 60)
+    task = real_task(attached=False)
+
+    async def script():
+        await asyncio.sleep(0.2)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            attach(task, SimpleNamespace(session_id="late"), api_key="k")
+        await task.queue_frame(EndFrame())
+
+    await run(task, script)
+    assert "AudioBufferProcessor" not in [
+        type(p).__name__ for p in task.pipeline.processors[1].processors
+    ]
+    assert len(messages(caplog, "calls are not recorded")) == 1
+    assert ended(http)["observability"] == {"mode": "observe"}
+
+
+# ── final-review fixes ───────────────────────────────────────────────────
+
+
+async def test_preparing_the_recording_shares_the_budget_and_call_ended_still_goes(
+    clock, http, monkeypatch, recording
+):
+    monkeypatch.setattr(cr, "_FINISH_BUDGET_S", 0.2)
+
+    async def stuck(*args):
+        await asyncio.sleep(3600)  # SuperBryn's API takes the request and never answers
+
+    monkeypatch.setattr(cr, "fetch_recording_upload_url", stuck)
+    call = await Call(clock, runner(), production=True).start()
+    began = time.monotonic()
+    await call.end(at=2)
+    assert time.monotonic() - began < 1
+    assert "stereo_recording_url" not in ended(http)["observability"]
+
+
+class ClientOnlyTransport(BaseTransport):
+    """A transport like SmallWebRTC's: its input and output keep only the client, whose callbacks are the
+    transport's own methods."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._register_event_handler("on_client_disconnected")
+        client = SimpleNamespace(
+            _callbacks=SimpleNamespace(on_client_disconnected=self._disconnected)
+        )
+        self.inp = BaseInputTransport(TransportParams())
+        self.out = PassThroughOutput(TransportParams(), enable_direct_mode=True)
+        self.inp._client = self.out._client = client
+
+    async def _disconnected(self, *args: Any) -> None:
+        await self._call_event_handler("on_client_disconnected", *args)
+
+    def input(self):
+        return self.inp
+
+    def output(self):
+        return self.out
+
+
+async def test_a_hang_up_is_heard_on_a_transport_reached_through_its_client(http):
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.task import PipelineTask
+
+    transport = ClientOnlyTransport()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        task = PipelineTask(
+            Pipeline([Forward(), transport.output()]),
+            cancel_on_idle_timeout=False,
+            enable_rtvi=False,
+        )
+    attach(task, SimpleNamespace(session_id="sess-webrtc"), api_key="k", record=False)
+    assert len(transport._event_handlers["on_client_disconnected"].handlers) == 1
+
+    async def script():
+        await asyncio.sleep(0.05)
+        await transport._disconnected(None)
+        await asyncio.sleep(0.05)
+        await task.queue_frame(EndFrame())
+
+    await run(task, script)
+    assert ended(http)["ended_by"] == "caller"
+
+
+def test_the_handle_never_raises_on_values_it_cannot_take(caplog):
+    report = cr.CallReport()
+    report.set_custom_data({"team_id": "t-42"})
+    report.set_custom_data(None)
+    report.update_custom_data(["not", "a", "dict"])
+    report.set_call_end_reason(5)
+    report.set_recording_url(5)
+    assert report._custom_data == {"team_id": "t-42"} and report._external_recording is None
+    assert messages(caplog, "update_custom_data takes a dict, got list")
+    report.set_call_end_reason("x" * 300)
+    assert len(report._end_reason) == 200
+
+
+async def test_the_recorders_cleanup_closes_a_file_it_never_uploaded():
+    from superbryn_pipecat_observer.audio_recorder import SuperbrynAudioRecorder
+
+    recorder = SuperbrynAudioRecorder()
+    await recorder.start()
+    await recorder._write_chunk(b"\x00\x01" * 160, 16000, 1)
+    path = recorder._tmp_path
+    assert recorder._wave_writer is not None and path.exists()
+    recorder.cleanup()
+    assert recorder._wave_writer is None and not path.exists()
+
+
+# ── second review ────────────────────────────────────────────────────────
+
+
+async def test_a_call_that_does_not_capture_logs_clears_the_capture_it_inherits(
+    clock, http, app_logs_info
+):
+    a = await Call(clock, runner(), production=True, record=False).start()
+    Call(
+        clock, runner(), production=True, record=False, capture_logs=False
+    )  # attached in the same context
+    logging.getLogger("agent").info("the second call's line")
+    assert a.observer._logs.records == []
+
+
+def test_with_no_logging_config_warnings_still_reach_stderr_while_a_call_captures(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+    capture = cr._LogCapture()
+    capture.start()
+    try:
+        logging.getLogger("httpx").warning("still printed")
+        logging.getLogger("httpx").info("below the last resort")
+    finally:
+        capture.stop()
+    err = capsys.readouterr().err
+    assert "still printed" in err and "below the last resort" not in err
+
+
+def test_custom_data_takes_any_mapping_and_attach_never_raises_on_what_it_is_given(caplog):
+    from collections import UserDict
+    from types import MappingProxyType
+
+    report = cr.CallReport()
+    report.set_custom_data(MappingProxyType({"team_id": "t-42"}))
+    report.update_custom_data(UserDict({"enterprise_id": "e-1"}))
+    assert report._custom_data == {"team_id": "t-42", "enterprise_id": "e-1"}
+
+    class Ambiguous:  # like a numpy array: asking whether it is empty raises
+        def __bool__(self):
+            raise ValueError("truth value is ambiguous")
+
+    handle = attach(FakeTask(), runner(), api_key="k", custom_data=Ambiguous())
+    assert handle._custom_data == {}
+    assert messages(caplog, "set_custom_data takes a dict, got Ambiguous")
+    handle.set_call_end_reason(5)
+    assert messages(caplog, "set_call_end_reason takes text, got int")
+
+
+async def test_a_slow_prompt_push_never_holds_call_ended(clock, http, monkeypatch):
+    monkeypatch.setattr(cr, "_FINISH_BUDGET_S", 0.3)
+
+    async def slow_push(**kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(cr, "push_prompt", slow_push)
+    call = Call(clock, superbryn_call_id="sb", prompt="You are Ava.")
+    await call.observer.on_pipeline_started()
+    began = time.monotonic()
+    await call.end(at=2)
+    assert time.monotonic() - began < 1
+    assert [e["event"] for e in http.events()] == ["call.started", "call.ended"]

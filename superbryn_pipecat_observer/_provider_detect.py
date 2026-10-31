@@ -1,5 +1,5 @@
 """
-Provider detection from model / module / voice strings.
+Provider detection from model strings.
 
 Lifted from livekit-evals so both SDKs stamp identical provider names in the
 normalized call payload (lets the SuperBryn analytics roll up
@@ -71,23 +71,3 @@ def detect_provider_from_model(model_name: str | None) -> str:
         return "livekit"
 
     return "unknown"
-
-
-def detect_provider_from_module(module_path: str | None) -> str:
-    """
-    Extract provider name from a Pipecat service's __module__.
-
-    Pipecat services live under `pipecat.services.<provider>.<llm|stt|tts>`,
-    e.g. `pipecat.services.deepgram.stt` → "deepgram".
-    """
-    if not module_path:
-        return "unknown"
-    parts = module_path.split(".")
-    if "pipecat" in parts and "services" in parts:
-        try:
-            idx = parts.index("services")
-            if idx + 1 < len(parts):
-                return parts[idx + 1]
-        except ValueError:
-            pass
-    return parts[-1] if parts else "unknown"

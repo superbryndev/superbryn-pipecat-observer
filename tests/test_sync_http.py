@@ -34,19 +34,19 @@ ACCEPTED = {
 
 
 def test_sync_manifest_requires_api_key(monkeypatch):
-    monkeypatch.setitem(config_sync.WEBHOOK_CONFIG, "api_key", "")
+    monkeypatch.setitem(config_sync.API_CONFIG, "api_key", "")
     with pytest.raises(ValueError, match="API key missing"):
         sync_manifest({"source": "pipecat"})
 
 
 async def test_async_sync_requires_api_key(monkeypatch):
-    monkeypatch.setitem(config_sync.WEBHOOK_CONFIG, "api_key", "")
+    monkeypatch.setitem(config_sync.API_CONFIG, "api_key", "")
     with pytest.raises(ValueError, match="API key missing"):
         await async_sync_config(FakePipeline([]))
 
 
 def test_sync_manifest_requires_base_url(monkeypatch):
-    monkeypatch.setitem(config_sync.WEBHOOK_CONFIG, "api_base_url", "")
+    monkeypatch.setitem(config_sync.API_CONFIG, "api_base_url", "")
     with pytest.raises(ValueError, match="base URL"):
         sync_manifest({"source": "pipecat"}, api_key="sk_agent_x")
 

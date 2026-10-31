@@ -2,11 +2,11 @@
 Pipeline check for the SuperBryn Pipecat SDK — runs fully on this machine.
 
 A real Pipecat pipeline (aggregators, function calling, output transport,
-audio recorder) runs a scripted support call with stand-in STT / LLM / TTS.
-Both SDK paths are attached, as a customer would: the obs observer
-(`SuperbrynObserver`) and the evals path (`attach_test_data`). They ship to a
-local catcher instead of SuperBryn, and a checklist compares what each sent
-against what actually happened.
+the recorder attach() inserts) runs a scripted support call with stand-in
+STT / LLM / TTS, reported with `attach(task, runner_args)` as a customer
+would: as a production call in every scenario, and as a SuperBryn test call
+in `test_call`. The report goes to a local catcher instead of SuperBryn, and
+a checklist compares what was sent against what actually happened.
 
 Run (no API keys, no network, ~20s per scenario):
     uv run python examples/pipeline_check/run.py                 # every scenario
@@ -24,6 +24,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -35,7 +36,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema  # noqa: E402
 from pipecat.frames.frames import EndFrame, TTSSpeakFrame  # noqa: E402
 from pipecat.pipeline.pipeline import Pipeline  # noqa: E402
 from pipecat.pipeline.runner import PipelineRunner  # noqa: E402
-from pipecat.pipeline.task import PipelineParams  # noqa: E402
+from pipecat.pipeline.task import PipelineParams, PipelineTask  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 from pipecat.processors.aggregators.llm_response_universal import (  # noqa: E402
     LLMContextAggregatorPair,
@@ -54,12 +55,12 @@ from scripted_services import (  # noqa: E402
     ScriptedTTSService,
 )
 
-from superbryn_pipecat_observer import SuperbrynObserver, attach_test_data  # noqa: E402
+from superbryn_pipecat_observer import attach  # noqa: E402
 
 API_KEY = "sb_pipeline_check"
 AGENT_ID = "6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
-AGENT_NAME = "pipeline-check-bot"
-CUSTOM_METADATA = {"campaign": "pipeline-check", "tenant_id": "acme-local"}
+SESSION_ID = "8c0f3e52-6b1d-4f7a-9e2c-5d4b3a291807"
+CUSTOM_DATA = {"campaign": "pipeline-check", "tenant_id": "acme-local", "workflow_id": 7}
 
 SYSTEM_PROMPT = "You are Acme's support agent. Look up orders with lookup_order."
 GREETING = "Hello, thanks for calling Acme support. How can I help you today?"
@@ -96,6 +97,7 @@ class Scenario:
     barge_in: set[int] = field(default_factory=set)
     token_delay: float = 0.01
     first_reply: str = FIRST_REPLY
+    test_call: bool = False  # a SuperBryn test call (surface testing), else a production call
 
 
 SCENARIOS = [
@@ -119,6 +121,9 @@ SCENARIOS = [
         word_timestamps=True,
         token_delay=0.12,
     ),
+    Scenario(
+        "test_call", "README setup on a SuperBryn test call: reported, not recorded", test_call=True
+    ),
 ]
 
 
@@ -134,8 +139,9 @@ def expected_for(scenario: Scenario) -> Expected:
     return Expected(
         api_key=API_KEY,
         agent_id=AGENT_ID,
-        agent_name=AGENT_NAME,
-        custom_metadata=CUSTOM_METADATA,
+        surface="testing" if scenario.test_call else "observability",
+        call_id=f"pipeline-check-{scenario.name}" if scenario.test_call else SESSION_ID,
+        custom_data=CUSTOM_DATA,
         agent_lines=spoken,
         unspoken=unspoken,
         cut_off=cut_off,
@@ -199,22 +205,19 @@ async def run_call(scenario: Scenario, dump: Path | None = None) -> list[Check]:
         ]
     )
 
-    observer = SuperbrynObserver(
-        agent_id=AGENT_ID,
-        agent_name=AGENT_NAME,
-        api_key=API_KEY,
-        webhook_url=catcher.webhook_url,
-        api_base_url=catcher.base_url,
-        custom_metadata=CUSTOM_METADATA,
-    )
-    extra = {"params": PipelineParams(enable_metrics=True)} if scenario.own_params else {}
-    task = observer.monitor_and_create_task(pipeline, transport=transport, **extra)
-    attach_test_data(
+    params = PipelineParams(enable_metrics=True) if scenario.own_params else PipelineParams()
+    task = PipelineTask(pipeline, params=params)
+    # as a bot's runner passes them; a test call carries SuperBryn's test ID in the start body
+    body = {"superbryn_call_id": f"pipeline-check-{scenario.name}"} if scenario.test_call else {}
+    attach(
         task,
+        SimpleNamespace(session_id=SESSION_ID, body=body),
         api_key=API_KEY,
         agent_id=AGENT_ID,
         base_url=catcher.base_url,
-        superbryn_call_id=f"pipeline-check-{scenario.name}",
+        custom_data=CUSTOM_DATA,
+        # the test call names itself by its ID, as a Custom cURL trigger's call would
+        call_id=f"pipeline-check-{scenario.name}" if scenario.test_call else None,
     )
     await task.queue_frames([TTSSpeakFrame(GREETING)])
 
@@ -228,16 +231,10 @@ async def run_call(scenario: Scenario, dump: Path | None = None) -> list[Check]:
 
     if dump:
         dump.mkdir(parents=True, exist_ok=True)
-        out = {"obs": catcher.caught.webhooks, "evals": catcher.caught.test_events}
-        (dump / f"{scenario.name}.json").write_text(json.dumps(out, indent=2, default=str))
+        out = json.dumps(catcher.caught.events, indent=2, default=str)
+        (dump / f"{scenario.name}.json").write_text(out)
 
-    return run_checks(
-        catcher.caught,
-        truth,
-        expected_for(scenario),
-        session_id=observer.session_id,
-        wall_seconds=wall_seconds,
-    )
+    return run_checks(catcher.caught, truth, expected_for(scenario), wall_seconds=wall_seconds)
 
 
 def main() -> None:
@@ -250,6 +247,8 @@ def main() -> None:
         loguru_logger.remove()
         loguru_logger.add(sys.stderr, level="ERROR")
     logging.basicConfig(level=logging.WARNING)
+    # the agent's own lines at INFO, as an app that logs them configures; capture_logs takes what this lets through
+    logging.getLogger("agent").setLevel(logging.INFO)
 
     chosen = [s for s in SCENARIOS if not args.scenario or s.name in args.scenario]
     results: dict[str, list[Check]] = {}

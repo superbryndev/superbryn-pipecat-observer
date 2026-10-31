@@ -2,7 +2,7 @@
 
 They subclass Pipecat's real base classes, so the real pipeline machinery
 (aggregators, metrics, function calls, output transport) runs unchanged.
-Module paths mimic Deepgram / OpenAI / Cartesia so the observer's
+Module paths mimic Deepgram / OpenAI / Cartesia so the report's
 provider detection is exercised too. Each stand-in records ground truth
 on a shared `GroundTruth` for the checklist to compare against.
 """
@@ -417,7 +417,8 @@ class LocalMockTransport(BaseTransport):
         super().__init__()
         self._caller = caller
         self._output = LocalMockOutputTransport(TransportParams(audio_out_enabled=True))
-        # Same event as network transports, so the observer's hangup hook attaches
+        self._output._transport = self  # as network transports' outputs keep theirs
+        # Same event as network transports, so attach()'s hang-up hook attaches
         self._register_event_handler("on_client_disconnected")
 
     def input(self) -> FrameProcessor:

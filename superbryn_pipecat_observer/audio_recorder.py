@@ -1,78 +1,25 @@
 """
-SuperbrynAudioRecorder — in-pipeline audio capture for SuperbrynObserver.
+SuperbrynAudioRecorder: in-pipeline audio capture for a production call's report.
 
-Wraps Pipecat's ``AudioBufferProcessor`` so the observer can ship a
-single WAV file to SuperBryn at end of session, regardless of which
-transport the customer is on (Daily, Twilio, Plivo, Vobiz, WebRTC, raw
-WebSocket — anything Pipecat speaks). This is the *only* recording
-path in the SDK: we don't fetch carrier-side recordings, which means
-customers never need to share carrier credentials with SuperBryn and
-plain-WebRTC / WebSocket transports are covered automatically.
-
-Pipecat's ``AudioBufferProcessor`` captures the raw user + bot PCM as
-it flows through the pipeline. We write it out as a WAV to a temp
-file, hand the path to the observer, and the observer uploads it
-**directly to S3** via a presigned PUT URL fetched from the SuperBryn
-API (``POST /api/recording-upload-url``). Orchestration is never on
-the audio data path. The temp file is ``os.unlink``'d before the
-finalize coroutine returns.
-
-Usage
------
-::
-
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from superbryn_pipecat_observer import SuperbrynObserver, SuperbrynAudioRecorder
-
-    recorder = SuperbrynAudioRecorder(num_channels=2)  # user-left, bot-right
-
-    pipeline = Pipeline([
-        transport.input(),
-        stt,
-        ctx.user(),
-        llm,
-        tts,
-        recorder.processor,         # insert BEFORE transport.output()
-        transport.output(),
-        ctx.assistant(),
-    ])
-
-    observer = SuperbrynObserver(
-        agent_name="my-bot",
-        transport=transport,
-        audio_recorder=recorder,
-    )
-
-    task = PipelineTask(pipeline, observers=[observer],
-                        params=PipelineParams(enable_usage_metrics=True))
-    observer.attach_to_task(task)
-
-    @transport.event_handler("on_client_connected")
-    async def _on_connect(t, c):
-        await recorder.start()
-
-Stereo by default
------------------
-We default to ``num_channels=2`` because SuperBryn's downstream STT
-pipeline (Deepgram in multichannel mode) gets perfect speaker
-separation when user audio is on the left channel and bot audio is on
-the right. Mono recordings work too but require AI-based diarization
-which is less accurate.
+Wraps Pipecat's ``AudioBufferProcessor``, which attach() puts right before the
+output transport, so one stereo WAV (the caller left, the agent right) is
+captured on any transport Pipecat speaks (Daily, Twilio, Plivo, Vobiz,
+WebRTC, raw WebSocket) without carrier credentials. At the end of the call
+the WAV goes to a temp file, the report uploads it **directly to S3**
+through a presigned PUT URL from the SuperBryn API
+(``POST /api/recording-upload-url``), and the temp file is deleted.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
 import wave
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:  # pragma: no cover
-    from .observer import SuperbrynObserver
+from typing import Any
 
 logger = logging.getLogger("superbryn_pipecat_observer.audio_recorder")
 
@@ -84,20 +31,19 @@ _DEFAULT_SAMPLE_RATE = 16000
 
 
 class SuperbrynAudioRecorder:
-    """In-pipeline audio capture for SuperbrynObserver.
+    """In-pipeline audio capture for a production call.
 
     Owns a Pipecat ``AudioBufferProcessor`` and a temp WAV file. The
-    observer reads ``finalize()`` at end-of-session to get the path,
+    report reads ``finalize()`` at the end of the call to get the path,
     uploads it to S3 via a presigned PUT, then deletes the file.
 
     Failure modes:
       - If ``pipecat`` isn't installed, this class still imports cleanly
-        and ``processor`` is ``None`` — the observer treats that the
-        same as ``audio_recorder=None`` (no recording captured).
+        and ``processor`` is ``None``: the call is not recorded.
       - If the buffer emits no ``on_audio_data`` events before finalize
         (very short calls, transport never produced audio), the WAV
         file is closed empty and finalize returns ``None`` so the
-        observer skips the upload step.
+        upload is skipped.
     """
 
     def __init__(
@@ -145,7 +91,7 @@ class SuperbrynAudioRecorder:
         except Exception as exc:  # pragma: no cover - surfaced via warning
             logger.warning(
                 "AudioBufferProcessor unavailable (%s) — SuperbrynAudioRecorder will no-op. "
-                "Make sure pipecat-ai >= 0.0.50 is installed.",
+                "Make sure pipecat-ai >= 1.4 is installed.",
                 exc,
             )
             return None
@@ -207,9 +153,8 @@ class SuperbrynAudioRecorder:
             logger.warning("SuperbrynAudioRecorder.start failed: %s", exc)
 
     async def stop(self) -> None:
-        """Tell the underlying processor to stop. The observer calls this
-        from ``_finalize_session`` so the buffer flushes its final
-        ``on_audio_data`` event before we close the WAV.
+        """Tell the underlying processor to stop, so the buffer flushes
+        its final ``on_audio_data`` event before the WAV is closed.
         """
         if self.processor is None:
             return
@@ -267,12 +212,11 @@ class SuperbrynAudioRecorder:
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
-    async def finalize(self, _observer: SuperbrynObserver | None = None) -> Path | None:
+    async def finalize(self) -> Path | None:
         """Stop capture, flush the WAV, and return the temp file path.
 
-        Returns ``None`` if no audio was ever captured — the observer
-        then skips the S3 upload step. The caller (observer) is
-        responsible for deleting the file once it's been uploaded.
+        Returns ``None`` if no audio was ever captured, and the S3 upload
+        is skipped. The caller deletes the file once it's been uploaded.
         """
         if self.processor is None:
             return None
@@ -355,14 +299,16 @@ class SuperbrynAudioRecorder:
         """Sample rate of the captured audio (updated on first chunk)."""
         return self._sample_rate
 
-    @property
-    def bytes_written(self) -> int:
-        return self._bytes_written
-
     def cleanup(self) -> None:
-        """Best-effort temp-file removal. Called by the observer after
-        a successful upload, and also as a safety net in error paths.
+        """Best-effort temp-file removal, after the upload and on every
+        error path.
         """
+        if (
+            self._wave_writer is not None
+        ):  # the upload was skipped: close the file before removing it
+            with contextlib.suppress(Exception):
+                self._wave_writer.close()
+            self._wave_writer = None
         if self._tmp_path is None:
             return
         try:
