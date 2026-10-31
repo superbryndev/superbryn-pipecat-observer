@@ -73,6 +73,9 @@ SuperBryn test calls) and posts one body to `/public-api/v1/calls/agent-data`. T
   `superbryn.pipecat.*`).
   `ToolsSchema` comes from its Pipecat 1.14 module, and an `attach()` after the task started no longer inserts
   the recorder on Pipecat 1.14.
+- `configuration.turn_detection.preemptive_generation` is true on Pipecat 1.15 too: 1.15 split
+  `LLMTurnCompletionUserTurnStopStrategy` off `ExternalUserTurnCompletionStopStrategy` and added
+  `EagerUserTurnStopStrategy`, so each early-drafting stop strategy is now recognised by its own name.
 
 ### Removed
 - `SuperbrynObserver` (with `monitor_*`, `simulate_*`, the deprecated `observe_*` / `track_*`,

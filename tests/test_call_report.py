@@ -1545,6 +1545,37 @@ async def test_interruption_settings_from_the_user_turn_start_strategies(clock, 
     }
 
 
+@pytest.mark.parametrize(
+    "name, early",
+    [
+        ("ExternalUserTurnCompletionStopStrategy", True),
+        ("LLMTurnCompletionUserTurnStopStrategy", True),
+        ("EagerUserTurnStopStrategy", True),
+        ("SpeechTimeoutUserTurnStopStrategy", False),
+    ],
+)
+async def test_early_drafting_from_the_user_turn_stop_strategies(clock, http, name, early):
+    """Pipecat 1.15 took LLM turn completion off the external-completion class: each counts by its own name."""
+    from pipecat.turns import user_stop
+
+    cls = getattr(user_stop, name, None)
+    if cls is None:
+        pytest.skip(f"{name} is not in this Pipecat version")
+    strategy = cls.__new__(cls)  # only its class is read
+    controller = SimpleNamespace(_user_turn_strategies=SimpleNamespace(stop=[strategy], start=None))
+    call = await Call(clock, superbryn_call_id="sb").start()
+    await call.push(
+        LLMContextFrame(context=LLMContext()),
+        at=1,
+        source=SimpleNamespace(_user_turn_controller=controller),
+    )
+    await call.end(at=2)
+    assert (
+        ended(http)["diagnostics"]["configuration"]["turn_detection"]["preemptive_generation"]
+        is early
+    )
+
+
 def _alternative(confidence):
     return SimpleNamespace(transcript="hi there", confidence=confidence)
 

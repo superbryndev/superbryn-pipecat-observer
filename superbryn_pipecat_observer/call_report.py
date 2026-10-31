@@ -133,9 +133,23 @@ try:
 except ImportError:  # pragma: no cover - depends on the Pipecat version
     MinWordsUserTurnStartStrategy = VADUserTurnStartStrategy = None  # type: ignore[assignment,misc]
 try:
-    from pipecat.turns.user_stop import ExternalUserTurnCompletionStopStrategy
+    from pipecat.turns import user_stop as _user_stop
 except ImportError:  # pragma: no cover - depends on the Pipecat version
-    ExternalUserTurnCompletionStopStrategy = None  # type: ignore[assignment,misc]
+    _user_stop = None  # type: ignore[assignment]
+# Stop strategies that run the LLM before the turn is final. 1.15 took LLMTurnCompletionUserTurnStopStrategy off
+# ExternalUserTurnCompletionStopStrategy and added the eager one, so each is looked up by name.
+EARLY_DRAFT_STOP_STRATEGIES: tuple[type, ...] = tuple(
+    s
+    for s in (
+        getattr(_user_stop, name, None)
+        for name in (
+            "ExternalUserTurnCompletionStopStrategy",
+            "LLMTurnCompletionUserTurnStopStrategy",
+            "EagerUserTurnStopStrategy",
+        )
+    )
+    if isinstance(s, type)
+)
 
 logger = logging.getLogger("superbryn_pipecat_observer.call_report")
 
@@ -1331,12 +1345,12 @@ class _Capture:
         """How the caller interrupts, from the user turn start strategies the user aggregator (or turn processor)
         holds: on when a strategy interrupts the bot, the min-words strategy's words, VAD's start time. And whether
         the LLM starts before the turn is final: a stop strategy that leaves completion to an external judge (the
-        LLM's own markers) runs inference on each deferred detector's trigger, and an incomplete turn drops it."""
+        LLM's own markers) runs inference on each deferred detector's trigger, and an incomplete turn drops it; an eager one
+        answers while the turn is still open."""
         controller = getattr(source, "_user_turn_controller", None)
         stop = getattr(getattr(controller, "_user_turn_strategies", None), "stop", None)
         if self._preemptive is None and isinstance(stop, list) and stop:
-            judged = ExternalUserTurnCompletionStopStrategy
-            self._preemptive = judged is not None and any(isinstance(s, judged) for s in stop)
+            self._preemptive = any(isinstance(s, EARLY_DRAFT_STOP_STRATEGIES) for s in stop)
         if self._interruptions is not None or MinWordsUserTurnStartStrategy is None:
             return
         strategies = getattr(getattr(controller, "_user_turn_strategies", None), "start", None)
